@@ -524,6 +524,10 @@ class TranslationSetting(QDialog):
         stream_enabled = QCheckBox(_('Enable streaming response'))
         genai_layout.addRow(_('Stream'), stream_enabled)
 
+        context_enabled = QCheckBox(
+            _('Keep previous translations as context'))
+        genai_layout.addRow(_('Context'), context_enabled)
+
         sampling_btn_group = QButtonGroup(sampling_widget)
         sampling_btn_group.addButton(temperature, 0)
         sampling_btn_group.addButton(top_p, 1)
@@ -664,6 +668,17 @@ class TranslationSetting(QDialog):
                 config.get('stream', self.current_engine.stream))
             stream_enabled.toggled.connect(
                 lambda checked: config.update(stream=checked))
+            # Context (Gemini only)
+            context_enabled.setVisible(is_gemini)
+            try:
+                context_enabled.toggled.disconnect()
+            except Exception:
+                pass
+            if is_gemini:
+                context_enabled.setChecked(
+                    config.get('keep_context', self.current_engine.keep_context))
+                context_enabled.toggled.connect(
+                    lambda checked: config.update(keep_context=checked))
             genai_group.setVisible(True)
 
         def choose_default_engine(index):
