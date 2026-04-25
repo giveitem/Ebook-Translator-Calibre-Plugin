@@ -1,10 +1,11 @@
 import os.path
 
-from qt.core import QMenu, QSettings
-from calibre.gui2.actions import InterfaceAction
-from calibre.utils.config_base import plugin_dir
-from calibre.ebooks.conversion.config import get_input_format_for_book
-
+from qt.core import QMenu, QSettings  # type: ignore
+from calibre.utils.localization import _  # type: ignore
+from calibre.gui2.actions import InterfaceAction  # type: ignore
+from calibre.utils.config_base import plugin_dir  # type: ignore
+from calibre.ebooks.conversion.config import (  # type: ignore
+    get_input_format_for_book)
 from . import EbookTranslator
 from .lib.utils import uid
 from .lib.ebook import Ebooks
@@ -19,7 +20,8 @@ from .components import AlertMessage, ModeSelection
 from .advanced import CreateTranslationProject, AdvancedTranslation
 
 
-load_translations()
+load_translations()  # type: ignore
+
 upgrade_config()
 
 
@@ -28,7 +30,7 @@ class EbookTranslatorGui(InterfaceAction):
     action_spec = (
         _('Translate Book'), None, _('Translate Ebook Content'), None)
     title = '%s - %s' % (EbookTranslator.title, EbookTranslator.__version__)
-    settings = QSettings(os.path.join(
+    ui_settings = QSettings(os.path.join(
         plugin_dir, EbookTranslator.identifier, 'settings.ini'),
         QSettings.Format.IniFormat)
 
@@ -38,9 +40,9 @@ class EbookTranslatorGui(InterfaceAction):
 
     def genesis(self):
         try:
-            self.icon = get_icons('images/icon.png', self.name)
+            self.icon = get_icons('images/icon.png', self.name)  # type: ignore
         except Exception:
-            self.icon = get_icons('images/icon.png')
+            self.icon = get_icons('images/icon.png')  # type: ignore
 
         menu = QMenu(self.gui)
         menu.addAction(
@@ -58,7 +60,7 @@ class EbookTranslatorGui(InterfaceAction):
 
         self.alert = AlertMessage(self.gui)
 
-        if not getattr(self.gui, 'bookfere_ebook_translator', None):
+        if not getattr(self.gui, 'bookfere_ebook_translator', False):
             self.gui.bookfere_ebook_translator = self.Status()
 
     def advanced_translation_window(self, ebook):
@@ -66,8 +68,7 @@ class EbookTranslatorGui(InterfaceAction):
         if self.show_window(name):
             return
         worker = ConversionWorker(self.gui, self.icon)
-        window = AdvancedTranslation(
-            self.gui, self.qaction.icon(), worker, ebook)
+        window = AdvancedTranslation(self, self.gui, worker, ebook)
         window.setMinimumWidth(1200)
         window.setMinimumHeight(680)
         window.setWindowTitle(
@@ -172,19 +173,21 @@ class EbookTranslatorGui(InterfaceAction):
         identifier = name.split('_')[0]
 
         window_size = 'window_size/%s' % identifier
-        size = self.settings.value(window_size)
-        size and window.resize(size)
+        size = self.ui_settings.value(window_size)
+        if size:
+            window.resize(size)
 
         window_position = 'window_position/%s' % identifier
-        position = self.settings.value(window_position)
-        position and window.restoreGeometry(position)
+        position = self.ui_settings.value(window_position)
+        if position:
+            window.restoreGeometry(position)
 
         windows = self.gui.bookfere_ebook_translator.windows
         windows[name] = window
 
         def setup_window():
-            self.settings.setValue(window_size, window.size())
-            self.settings.setValue(window_position, window.saveGeometry())
+            self.ui_settings.setValue(window_size, window.size())
+            self.ui_settings.setValue(window_position, window.saveGeometry())
             windows.pop(name)
         window.finished.connect(setup_window)
 

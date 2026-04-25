@@ -3,12 +3,13 @@ import json
 import copy
 from typing import Any
 
-from lxml import etree
-from calibre import prepare_string_for_xml as xml_escape
-from calibre.utils.logging import default_log as log
+from lxml import etree  # type: ignore
+
+from calibre import prepare_string_for_xml as xml_escape  # type: ignore
 
 from .utils import (
-    ns, uid, trim, sorted_mixed_keys, open_file, css_to_xpath, create_xpath)
+    log, ns, uid, trim, sorted_mixed_keys, open_file, css_to_xpath,
+    create_xpath)
 from .config import get_config
 
 
@@ -76,14 +77,14 @@ class Element:
     def set_reserve_pattern(self, pattern):
         self.reserve_pattern = pattern
 
-    def get_name(self):
+    def get_name(self) -> str | None:
         return None
 
-    def get_attributes(self):
+    def get_attributes(self) -> str | None:
         return None
 
     def delete(self):
-        pass
+        return None
 
     def get_raw(self):
         raise NotImplementedError()
@@ -97,8 +98,8 @@ class Element:
     def add_translation(self, translation=None):
         raise NotImplementedError()
 
-    def get_translation(self):
-        pass
+    def get_translation(self) -> str | None:
+        return None
 
 
 class SrtElement(Element):
@@ -492,6 +493,15 @@ class PageElement(Element):
 
 
 class Extraction:
+    # List the necessary non-inline-level elements according to the HTML spec:
+    # https://html.spec.whatwg.org/multipage/rendering.html#non-replaced-elements
+    non_inline_elements = (
+        'address', 'blockquote', 'dialog', 'div', 'figure', 'figcaption',
+        'footer', 'header', 'legend', 'main', 'p', 'pre', 'search', 'article',
+        'aside', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hgroup', 'nav',
+        'section', 'dd', 'dl', 'dt', 'menu', 'ol', 'ul', 'table', 'caption',
+        'colgroup', 'col', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th')
+
     def __init__(
             self, pages, priority_rules, rule_mode, filter_scope, filter_rules,
             ignore_rules):
@@ -551,11 +561,21 @@ class Extraction:
             elements.extend(self.extract_elements(page.id, body, []))
         return filter(self.filter_content, elements)
 
-    def is_priority(self, element):
+    def is_priority(self, element: etree._Element):
         for pattern in self.priority_patterns:
             if element.xpath(pattern, namespaces=ns):
                 return True
         return False
+
+    def is_inline_only(self, element: etree._Element):
+        """The purpose of this method is to ensure that if the element contains
+        only inline-level elements, it is regarded as a whole paragraph; there
+        is no need to further separate its children.
+        """
+        for tag in self.non_inline_elements:
+            if element.find(f'./x:{tag}', namespaces=ns) is not None:
+                return False
+        return True
 
     def need_ignore(self, element):
         for pattern in self.ignore_patterns:
@@ -574,7 +594,7 @@ class Extraction:
                 elements.append(PageElement(element, page_id, True))
                 continue
             element_has_content = False
-            if self.is_priority(element) or (
+            if self.is_priority(element) or self.is_inline_only(element) or (
                     element.text is not None and trim(element.text) != ''):
                 element_has_content = True
             else:
@@ -665,7 +685,7 @@ class ElementHandler:
         # conflicts with the mechanism of merge translation.
         default_rules = (
             'img', 'code', 'br', 'hr', 'sub', 'sup', 'kbd', 'abbr', 'wbr',
-            'var', 'canvas', 'svg', 'script', 'style')
+            'var', 'canvas', 'svg', 'script', 'style', 'math')
         self.reserve_pattern = create_xpath(default_rules + tuple(rules))
 
     def prepare_original(self, elements):
@@ -862,14 +882,14 @@ def get_page_elements(pages):
 def get_element_handler(placeholder, separator, direction):
     config = get_config()
     position_alias = {'before': 'above', 'after': 'below'}
-    position = config.get('translation_position', 'below')
+    position = config.get('translation_position') or 'below'
     position = position_alias.get(position) or position
     handler = ElementHandler(placeholder, separator, position)
     if config.get('merge_enabled'):
         handler = ElementHandlerMerge(placeholder, separator, position)
         handler.set_merge_length(config.get('merge_length'))
     handler.set_target_direction(direction)
-    column_gap = config.get('column_gap')
+    column_gap = config.get('column_gap') or {}
     gap_type = column_gap.get('_type')
     if gap_type is not None and gap_type in column_gap.keys():
         handler.set_column_gap((gap_type, column_gap.get(gap_type)))

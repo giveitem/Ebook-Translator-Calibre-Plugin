@@ -13,7 +13,7 @@ from .genai import GenAI
 from .languages import google, gemini
 
 
-load_translations()
+load_translations()  # type: ignore
 
 
 class GoogleFreeTranslateNew(Base):
@@ -21,7 +21,7 @@ class GoogleFreeTranslateNew(Base):
     alias = 'Google (Free) - New'
     free = True
     lang_codes = Base.load_lang_codes(google)
-    endpoint: str = 'https://translate-pa.googleapis.com/v1/translate'
+    endpoint = 'https://translate-pa.googleapis.com/v1/translate'
     need_api_key = False
 
     def get_headers(self):
@@ -58,7 +58,7 @@ class GoogleFreeTranslateHtml(Base):
     alias = 'Google (Free) - HTML'
     free = True
     lang_codes = Base.load_lang_codes(google)
-    endpoint: str = 'https://translate-pa.googleapis.com/v1/translateHtml'
+    endpoint = 'https://translate-pa.googleapis.com/v1/translateHtml'
     need_api_key = False
     support_html = True
 
@@ -141,7 +141,7 @@ class GoogleTranslate(Base):
                 '</a></sup>').replace('\n', '<br />')
 
     def _run_command(self, command, silence=False):
-        message = _('Cannot run the command "{}".')
+        error_msg = _('Cannot run the command "{}".').format(command)
         try:
             startupinfo = None
             # Prevent the popping console window on Windows.
@@ -155,14 +155,16 @@ class GoogleTranslate(Base):
         except Exception:
             if silence:
                 return None
-            raise Exception(
-                message.format(command, '\n\n%s' % traceback_error()))
+            error_msg += '\n\n%s' % traceback_error()
+            raise Exception(error_msg)
         if process.wait() != 0:
             if silence:
                 return None
-            raise Exception(
-                message.format(command, '\n\n%s' % process.stderr.read()))
-        return process.stdout.read().strip()
+            stderr = process.stderr
+            error_msg += f'\n\n{stderr.read()}' if stderr is not None else ''
+            raise Exception(error_msg)
+        stdout = process.stdout
+        return stdout.read().strip() if stdout is not None else ''
 
     def _get_gcloud_command(self):
         if self.gcloud is not None:
@@ -205,8 +207,9 @@ class GoogleTranslate(Base):
         if old_api_key is not None and time.time() - timestamp < 3600:
             return old_api_key
         # Temporarily add existing proxies.
-        self.proxy_uri and os.environ.update(
-            http_proxy=self.proxy_uri, https_proxy=self.proxy_uri)
+        if self.proxy_uri:
+            os.environ.update(
+                http_proxy=self.proxy_uri, https_proxy=self.proxy_uri)
         new_api_key = self._run_command([
             self._get_gcloud_command(), 'auth', 'application-default',
             'print-access-token'])
@@ -223,19 +226,7 @@ class GoogleBasicTranslateADC(GoogleTranslate):
     alias = 'Google (Basic) ADC'
     lang_codes = Base.load_lang_codes(google)
     endpoint = 'https://translation.googleapis.com/language/translate/v2'
-    api_key_hint = 'API key'
     need_api_key = False
-
-    def _create_body(self, text):
-        body = {
-            'format': 'html',
-            'model': 'nmt',
-            'target': self._get_target_code(),
-            'q': text
-        }
-        if not self._is_auto_lang():
-            body.update(source=self._get_source_code())
-        return body
 
     def get_headers(self):
         return {
@@ -245,16 +236,27 @@ class GoogleBasicTranslateADC(GoogleTranslate):
         }
 
     def get_body(self, text):
-        return json.dumps(self._create_body(text))
+        body = {
+            'format': 'html',
+            'model': 'nmt',
+            'target': self._get_target_code(),
+            'q': text
+        }
+        if not self._is_auto_lang():
+            body.update(source=self._get_source_code())
+        return json.dumps(body)
 
-    def get_result(self, data):
-        translations = json.loads(data)['data']['translations']
+    def get_result(self, response):
+        translations = json.loads(response)['data']['translations']
         return ''.join(unescape(i['translatedText']) for i in translations)
 
 
-class GoogleBasicTranslate(GoogleBasicTranslateADC):
+class GoogleBasicTranslate(GoogleTranslate):
     name = 'Google(Basic)'
     alias = 'Google (Basic)'
+    lang_codes = Base.load_lang_codes(google)
+    endpoint = 'https://translation.googleapis.com/language/translate/v2'
+    api_key_hint = 'API key'
     need_api_key = True
     using_tip = None
 
@@ -262,12 +264,24 @@ class GoogleBasicTranslate(GoogleBasicTranslateADC):
         return {'Content-Type': 'application/x-www-form-urlencoded'}
 
     def get_body(self, text):
-        body = self._create_body(text)
-        body.update(key=self.api_key)
+        body = {
+            'key': self.api_key,
+            'format': 'html',
+            'model': 'nmt',
+            'target': self._get_target_code(),
+            'q': text
+        }
+        if not self._is_auto_lang():
+            body.update(source=self._get_source_code())
         return body
+
+    def get_result(self, response):
+        translations = json.loads(response)['data']['translations']
+        return ''.join(unescape(i['translatedText']) for i in translations)
 
 
 class GoogleAdvancedTranslate(GoogleTranslate):
+
     name = 'Google(Advanced)'
     alias = 'Google (Advanced) ADC'
     lang_codes = Base.load_lang_codes(google)
@@ -276,8 +290,9 @@ class GoogleAdvancedTranslate(GoogleTranslate):
     need_api_key = False
 
     def get_endpoint(self):
-        return self.endpoint.format(
-            '%s:translateText' % self._get_project_id())
+        if self.endpoint is not None:
+            return self.endpoint.format(
+                '%s:translateText' % self._get_project_id())
 
     def get_headers(self):
         return {
@@ -334,7 +349,7 @@ class GeminiTranslate(GenAI):
 
     models: list[str] = []
     # TODO: Handle the default model more appropriately.
-    model: str | None = 'gemini-2.0-flash'
+    model: str | None = 'gemini-2.5-flash'
 
     def __init__(self):
         super().__init__()
@@ -365,14 +380,16 @@ class GeminiTranslate(GenAI):
     def get_models(self):
         endpoint = f'{self.endpoint}?key={self.api_key}'
         response = request(
-            endpoint, timeout=self.request_timeout, proxy_uri=self.proxy_uri)
+            endpoint, timeout=int(self.request_timeout),
+            proxy_uri=self.proxy_uri)
         models = []
-        for model in json.loads(response)['models']:
-            model_name = model['name'].split('/')[-1]
-            if model_name.startswith('gemini'):
-                model_desc = model['description']
-                if 'deprecated' not in model_desc:
-                    models.append(model_name)
+        if isinstance(response, str):
+            for model in json.loads(response)['models']:
+                model_name = model['name'].split('/')[-1]
+                if model_name.startswith('gemini'):
+                    model_desc = model['description']
+                    if 'deprecated' not in model_desc:
+                        models.append(model_name)
         return models
 
     def get_endpoint(self):

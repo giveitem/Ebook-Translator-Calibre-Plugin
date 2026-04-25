@@ -3,16 +3,19 @@ import re
 import json
 import shutil
 import sqlite3
+import sys
 import os.path
 import tempfile
 from datetime import datetime
 from glob import glob
 
+from calibre.utils.localization import _  # type: ignore
+
 from .utils import size_by_unit
 from .config import get_config
 
 
-load_translations()
+load_translations()  # type: ignore
 
 
 class Paragraph:
@@ -51,7 +54,7 @@ class Paragraph:
     def do_aligment(self, separator: str) -> None:
         """Verify alignment status if the translation is misaligned."""
         # Check if translation is aligned with original
-        if self.is_alignment(separator):
+        if self.translation is None or self.is_alignment(separator):
             return
         # Auto-add line spacing to translation text
         single_saparator = separator[0]
@@ -66,24 +69,47 @@ class Paragraph:
 
 
 def default_cache_path():
-    path = os.path.join(
-        tempfile.gettempdir(), 'com.bookfere.Calibre.EbookTranslator')
+    if sys.platform == 'win32':
+        # Use LOCALAPPDATA for Windows to avoid temp directory changes
+        local_appdata = os.environ.get('LOCALAPPDATA')
+        if local_appdata:
+            path = os.path.join(
+                local_appdata,
+                'calibre-cache',
+                'plugins',
+                'ebook-translator')
+        else:
+            # Fallback to user profile if LOCALAPPDATA is not available
+            path = os.path.join(
+                os.path.expanduser('~'),
+                'AppData',
+                'Local',
+                'calibre-cache',
+                'plugins',
+                'ebook-translator')
+    else:
+        # For macOS and Linux, keep using temp directory
+        path = os.path.join(
+            tempfile.gettempdir(), 'com.bookfere.Calibre.EbookTranslator')
+
     if not os.path.exists(path):
-        os.mkdir(path)
+        os.makedirs(path, exist_ok=True)
     return path
 
 
-def cache_path():
+def custom_cache_path():
     config = get_config()
     path = config.get('cache_path')
     if path and os.path.exists(path):
         return path
-    return default_cache_path()
+    path = default_cache_path()
+    config.save(cache_path=path)
+    return path
 
 
 class TranslationCache:
     fresh = True
-    dir_path = cache_path()
+    dir_path = custom_cache_path()
     cache_path = os.path.join(dir_path, 'cache')
     temp_path = os.path.join(dir_path, 'temp')
 
@@ -115,7 +141,8 @@ class TranslationCache:
     @classmethod
     def move(cls, dest):
         for dir_path in glob(os.path.join(cls.dir_path, '*')):
-            os.path.exists(dir_path) and shutil.move(dir_path, dest)
+            if os.path.exists(dir_path):
+                shutil.move(dir_path, dest)
         cls.dir_path = dest
         cls.cache_path = os.path.join(dest, 'cache')
         cls.temp_path = os.path.join(dest, 'temp')
@@ -130,7 +157,8 @@ class TranslationCache:
     @classmethod
     def remove(cls, filename):
         file_path = os.path.join(cls.cache_path, filename)
-        os.path.exists(file_path) and os.remove(file_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
     @classmethod
     def clean(cls):
@@ -256,10 +284,12 @@ class TranslationCache:
 
     def destroy(self):
         self.close()
-        os.path.exists(self.file_path) and os.remove(self.file_path)
+        if os.path.exists(self.file_path):
+            os.remove(self.file_path)
 
     def done(self):
-        self.persistence or self.destroy()
+        if not self.persistence:
+            self.destroy()
 
     def paragraph(self, id=None):
         return Paragraph(*self.first(id=id))
@@ -290,4 +320,5 @@ class TranslationCache:
 
 
 def get_cache(uid):
-    return TranslationCache(uid, get_config().get('cache_enabled'))
+    config = get_config()
+    return TranslationCache(uid, config.get('cache_enabled') or False)

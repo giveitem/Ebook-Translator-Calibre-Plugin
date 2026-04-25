@@ -1,20 +1,29 @@
 import re
+import os
 import sys
 import ssl
 import socket
 import hashlib
 import traceback
+from types import ModuleType
+from typing import Generator
 from subprocess import Popen
+from contextlib import contextmanager
 
-from calibre import get_proxies
-from mechanize import Browser, Request
-from mechanize._response import response_seek_wrapper as Response
+from mechanize import Browser, Request, HTTPError  # type: ignore
+from mechanize._response import response_seek_wrapper as Response  # type: ignore
 
-from ..lib.cssselect import GenericTranslator, SelectorError
+from calibre import get_proxies  # type: ignore
+from calibre.utils.logging import Log  # type: ignore
+
+from ..vendor import socks
+from ..vendor.cssselect import GenericTranslator, SelectorError
 
 
 ns = {'x': 'http://www.w3.org/1999/xhtml'}
 is_test = 'unittest' in sys.modules
+log = Log(level=Log.DEBUG if os.environ.get('CALIBRE_DEBUG') else Log.INFO)
+original_socket = socket.socket
 
 
 def dummy(*args, **kwargs):
@@ -25,24 +34,32 @@ def sep(char='═', count=38):
     return char * count
 
 
-def css(selector):
+def css(selector: str) -> str | None:
     try:
         return GenericTranslator().css_to_xpath(selector, prefix='self::x:')
     except SelectorError:
         return None
 
 
-def css_to_xpath(selectors):
+def css_to_xpath(selectors: tuple | list) -> list:
     patterns = []
+    simple_tag = re.compile(r'^[A-Za-z][\w-]*$')
     for selector in selectors:
-        if rule := css(selector):
-            patterns.append(rule)
+        rule = css(selector)
+        if rule is None:
+            continue
+        # Add support for matching elements that use their own namespaces.
+        if simple_tag.match(selector):
+            rule = f'({rule} or self::*[local-name()="{selector}"])'
+        patterns.append(rule)
     return patterns
 
 
-def create_xpath(selectors):
+def create_xpath(selectors: tuple | str) -> str | None:
     selectors = (selectors,) if isinstance(selectors, str) else selectors
-    return './/*[%s]' % ' or '.join(css_to_xpath(selectors))
+    if patterns := css_to_xpath(selectors):
+        return './/*[%s]' % ' or '.join(patterns)
+    return None
 
 
 def uid(*args):
@@ -138,24 +155,76 @@ def traceback_error():
 
 def request(
         url, data=None, headers={}, method='GET', timeout=30, proxy_uri=None,
-        raw_object=False) -> Response | str:
+        raw_object=False) -> Response | str | None:
     br = Browser()
     br.set_handle_robots(False)
-    # Do not verify SSL certificates
-    br.set_ca_data(
-        context=ssl._create_unverified_context(cert_reqs=ssl.CERT_NONE))
-    # Set up proxy
+
+    # Create a more robust SSL context
+    try:
+        # Try with proper SSL verification first
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = True
+        ssl_context.verify_mode = ssl.CERT_REQUIRED
+        br.set_ca_data(context=ssl_context)
+    except Exception:
+        # Fallback to unverified context if needed
+        br.set_ca_data(
+            context=ssl._create_unverified_context(cert_reqs=ssl.CERT_NONE))
+    # Set up a proxy; use the proxy settings if available, otherwise read from
+    # the environment.
     proxies: dict = {}
     if proxy_uri is not None:
         proxies.update(http=proxy_uri, https=proxy_uri)
     else:
         http = get_proxies(False).get('http')
-        http and proxies.update(http=http, https=http)
+        if http is not None:
+            proxies.update(http=http, https=http)
         https = get_proxies(False).get('https')
-        https and proxies.update(https=https)
-    proxies and br.set_proxies(proxies)
-    _request = Request(
-        url, data, headers=headers, timeout=timeout, method=method)
-    br.open(_request)
-    response: Response = br.response()
-    return response if raw_object else response.read().decode('utf-8').strip()
+        if https is not None:
+            proxies.update(https=https)
+    if len(proxies) > 0:
+        br.set_proxies(proxies)
+    # Make Mechanize raise detailed information when an HTTP error occurs.
+    try:
+        _request = Request(
+            url, data, headers=headers, timeout=timeout, method=method)
+        br.open(_request)
+        response: Response | None = br.response()
+        if response is None or raw_object:
+            return response
+        return response.read().decode('utf-8').strip()
+    except HTTPError as e:
+        raise Exception(traceback_error() + '\n\n' + e.read().decode('utf-8'))
+
+
+@contextmanager
+def socks_proxy(host: str, port: int) -> Generator[ModuleType, None, None]:
+    """This is a monkey-patch approach to enforce Mechanize to use a SOCKS5
+    proxy. The context manager restores the original socket after it exits.
+    """
+    log.debug('Backup original socket: ', id(socket.socket))
+    # Temporarily remove environment proxies to prevent conflicts with the
+    # SOCKS5 proxy, which might otherwise send connections through an HTTP
+    # proxy, causing a "General SOCKS server failure" error.
+    backup_http = os.environ.pop("http_proxy", None)
+    backup_https = os.environ.pop("https_proxy", None)
+    if socket.socket is not original_socket:
+        log.debug('Socket already patched: ', id(socket.socket))
+    else:
+        # TODO: There is a bug in asyncio environments where the socket may be
+        # patched multiple times due to race conditions.
+        log.debug('Patch socket: ', id(socks.socksocket))
+        socks.set_default_proxy(socks.SOCKS5, host, int(port), rdns=True)
+        socket.socket = socks.socksocket
+    try:
+        yield socket
+    finally:
+        if socket.socket is not original_socket:
+            log.debug('Restore original socket: ', id(original_socket))
+            socket.socket = original_socket
+            socks.set_default_proxy(None)
+        # Restore the environment proxies if any exist.
+        if backup_http is not None:
+            os.environ['http_proxy'] = backup_http
+        if backup_https is not None:
+            os.environ['https_proxy'] = backup_https

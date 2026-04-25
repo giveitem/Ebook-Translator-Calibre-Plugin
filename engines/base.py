@@ -1,30 +1,32 @@
+import socket
 import os.path
 from typing import Any
 
 from mechanize import HTTPError
-from mechanize._response import response_seek_wrapper as Response
-from calibre.utils.localization import lang_as_iso639_1
 
-from ..lib.utils import traceback_error, request
+from calibre.utils.localization import _, lang_as_iso639_1  # type: ignore
+
+from ..lib.utils import log, traceback_error, request, socks_proxy
 from ..lib.exception import UnexpectedResult
 
 from .languages import lang_directionality
 
 
-load_translations()
+load_translations()  # type: ignore
 
 
 class Base:
     name: str | None = None
     alias: str | None = None
-    free = False
+    free: bool = False
 
     lang_codes: dict[str, Any] = {}
     config: dict[str, Any] = {}
     endpoint: str | None = None
-    method = 'POST'
+    method: str = 'POST'
     headers: dict[str, str] = {}
     stream = False
+
     need_api_key = True
     api_key_hint = _('API Keys')
     api_key_pattern = r'^[^\s]+$'
@@ -41,10 +43,13 @@ class Base:
     max_error_count: int = 10
 
     def __init__(self):
-        self.source_lang: str | None = None
-        self.target_lang: str | None = None
-        self.proxy_uri: str | None = None
-        self.search_paths = []
+        self.source_lang: str
+        self.target_lang: str
+        self.search_paths: list = []
+
+        self.proxy_type: str | None = None  # http, socks5
+        self.proxy_host: str | None = None
+        self.proxy_port: int | None = None
 
         self.merge_enabled = False
         self.api_keys: list = self.config.get('api_keys', [])[:]
@@ -78,14 +83,16 @@ class Base:
         return lang_directionality.get(lang_code, 'auto')
 
     @classmethod
-    def get_source_code(cls, lang):
-        source_codes: dict = cls.lang_codes.get('source') or {}
-        return 'auto' if lang == _('Auto detect') else source_codes.get(lang)
+    def get_source_code(cls, lang) -> str:
+        source_codes: dict = cls.lang_codes['source']
+        if lang == _('Auto detect'):
+            return 'auto'
+        return source_codes[lang]
 
     @classmethod
-    def get_target_code(cls, lang):
-        target_codes: dict = cls.lang_codes.get('target') or {}
-        return target_codes.get(lang)
+    def get_target_code(cls, lang) -> str:
+        target_codes: dict = cls.lang_codes['target']
+        return target_codes[lang]
 
     @classmethod
     def get_iso639_target_code(cls, lang):
@@ -129,7 +136,7 @@ class Base:
     def set_search_paths(self, paths):
         self.search_paths = paths
 
-    def get_external_program(self, name, paths=[]):
+    def get_external_program(self, name: str, paths: list = []) -> str | None:
         for path in paths + self.search_paths:
             if not path.endswith('%s%s' % (os.path.sep, name)):
                 path = os.path.join(path, name)
@@ -140,20 +147,29 @@ class Base:
     def set_merge_enabled(self, enable):
         self.merge_enabled = enable
 
-    def set_source_lang(self, source_lang):
+    def set_source_lang(self, source_lang: str) -> None:
         self.source_lang = source_lang
 
-    def set_target_lang(self, target_lang):
+    def set_target_lang(self, target_lang: str) -> None:
         self.target_lang = target_lang
 
-    def get_target_lang(self):
+    def get_target_lang(self) -> str:
         return self.target_lang
 
-    def set_proxy(self, proxy=[]):
-        if isinstance(proxy, list) and len(proxy) == 2:
-            self.proxy_uri = '%s:%s' % tuple(proxy)
-            if not self.proxy_uri.startswith('http'):
-                self.proxy_uri = 'http://%s' % self.proxy_uri
+    def set_proxy(self, proxy_type: str, host: str, port: int):
+        log.debug(f'Proxy - type: {proxy_type}, host: {host}, port: {port}')
+        self.proxy_type = proxy_type
+        self.proxy_host = host
+        self.proxy_port = port
+
+    @property
+    def proxy_uri(self) -> str | None:
+        if not all((self.proxy_type, self.proxy_host, self.proxy_port)):
+            return None
+        uri = f'{self.proxy_host}:{self.proxy_port}'
+        if not uri.startswith('http'):
+            uri = f'http://{uri}'
+        return uri
 
     def set_concurrency_limit(self, limit):
         self.concurrency_limit = limit
@@ -177,19 +193,31 @@ class Base:
         return self._get_source_code() == 'auto'
 
     def translate(self, content):
+        response = None
         try:
-            response = request(
-                url=self.get_endpoint(), data=self.get_body(content),
-                headers=self.get_headers(), method=self.method,
-                timeout=self.request_timeout, proxy_uri=self.proxy_uri,
-                raw_object=self.stream)
+            params = {
+                'url': self.get_endpoint(),
+                'data': self.get_body(content),
+                'headers': self.get_headers(),
+                'method': self.method,
+                'proxy_uri': None,
+                'timeout': int(self.request_timeout),
+                'raw_object': self.stream
+            }
+            if self.proxy_type == 'socks5' and self.proxy_host is not None \
+                    and self.proxy_port is not None:
+                with socks_proxy(self.proxy_host, self.proxy_port):
+                    log.debug('Used socket: ', id(socket.socket))
+                    response = request(**params)
+            else:
+                if self.proxy_type == 'http':
+                    params['proxy_uri'] = self.proxy_uri
+                response = request(**params)
             return self.get_result(response)
         except Exception as e:
             # Combine the error messages for investigation.
-            error_message = traceback_error()
-            if isinstance(e, HTTPError):
-                error_message += '\n\n' + e.read().decode('utf-8')
-            elif not self.stream and 'response' in locals():
+            error_message = traceback_error() + '\n\n' + str(e)
+            if not self.stream and isinstance(response, str):
                 error_message += '\n\n' + response
             # Swap a valid API key if necessary.
             if self.need_swap_api_key(error_message) and self.swap_api_key():
@@ -207,7 +235,7 @@ class Base:
     def get_body(self, text):
         return text
 
-    def get_result(self, response: Response | bytes | str):
+    def get_result(self, response):
         return response
 
     def get_usage(self):

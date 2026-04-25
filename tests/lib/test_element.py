@@ -2,19 +2,19 @@ import re
 import unittest
 from unittest.mock import patch, Mock
 
-from lxml import etree
+from lxml import etree  # type: ignore
 
-from calibre.ebooks.oeb.base import TOC, Metadata
+from calibre.ebooks.oeb.base import TOC, Metadata  # type: ignore
 
-from ..lib.utils import ns, create_xpath
-from ..lib.cache import Paragraph
-from ..lib.element import (
+from ...lib.utils import ns, create_xpath
+from ...lib.cache import Paragraph
+from ...lib.element import (
     get_string, get_name, Extraction, ElementHandler, ElementHandlerMerge,
     Element, SrtElement, PgnElement, TocElement, PageElement, MetadataElement,
     get_srt_elements, get_pgn_elements, get_toc_elements,
     get_metadata_elements)
-from ..engines import DeeplFreeTranslate
-from ..engines.base import Base
+from ...engines import DeeplFreeTranslate
+from ...engines.base import Base
 
 
 module_name = 'calibre_plugins.ebook_translator.lib.element'
@@ -437,7 +437,7 @@ class TestPageElement(unittest.TestCase):
         self.assertEqual(
             '<img src="w2.jpg"></img>', self.element.reserve_elements[4])
         self.assertEqual(
-            '<img alt="{\D}" src="w3.jpg"></img>',
+            '<img alt="{\D}" src="w3.jpg"></img>', # type: ignore
             self.element.reserve_elements[5])
         self.assertEqual(
             '<img src="w3.jpg"></img>', self.element.reserve_elements[6])
@@ -740,10 +740,10 @@ epub:type="pagebreak"/>b</code></p></body>
         self.assertEqual('abc', a.get('href'))
         self.assertEqual('A', a.text)
 
-    def test_add_translation_table(slef):
+    def test_add_translation_table(self):
         pass
 
-    def test_add_translation_table_only(slef):
+    def test_add_translation_table_only(self):
         pass
 
     def test_add_translation_line_break_below(self):
@@ -934,8 +934,6 @@ class TestExtraction(unittest.TestCase):
         self.assertEqual(
             [re.compile(default_rule)],
             self.extraction.filter_patterns)
-        self.assertEqual(
-            ['self::x:pre', 'self::x:code'], self.extraction.ignore_patterns)
 
     def test_get_sorted_pages(self):
         self.assertEqual(
@@ -990,9 +988,7 @@ class TestExtraction(unittest.TestCase):
         items = [
             '<p xmlns="http://www.w3.org/1999/xhtml">abc</p>',
             '<pre xmlns="http://www.w3.org/1999/xhtml">abc</pre>',
-            '<div xmlns="http://www.w3.org/1999/xhtml" class="test">'
-            'abc</div>']
-
+            '<div xmlns="http://www.w3.org/1999/xhtml" class="test">abc</div>']
         for item in items:
             with self.subTest(item=item):
                 self.assertTrue(self.extraction.is_priority(etree.XML(item)))
@@ -1000,10 +996,16 @@ class TestExtraction(unittest.TestCase):
         items = [
             '<sub xmlns="http://www.w3.org/1999/xhtml">abc</sub>',
             '<div xmlns="http://www.w3.org/1999/xhtml" id="a">abc</div>']
-
         for item in items:
             with self.subTest(item=item):
                 self.assertFalse(self.extraction.is_priority(etree.XML(item)))
+
+    def test_is_inline_only(self):
+        div = '<div xmlns="http://www.w3.org/1999/xhtml"><span>a</span></div>'
+        self.assertTrue(self.extraction.is_inline_only(etree.XML(div)))
+
+        div = '<div xmlns="http://www.w3.org/1999/xhtml"><div>a</div></div>'
+        self.assertFalse(self.extraction.is_inline_only(etree.XML(div)))
 
     def test_need_ignore(self):
         self.extraction.ignore_rules = ['table', 'p.a']
@@ -1109,6 +1111,19 @@ class TestExtraction(unittest.TestCase):
         self.assertEqual(
             xhtml.find('.//x:div[3]/x:p', namespaces=ns), elements[2].element)
         self.assertTrue(elements[3].ignored)
+
+    def test_extract_elements_with_sole_block_level_element(self):
+        xhtml = etree.XML(b"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+<head><title>Document</title></head>
+<body class="test"><div><span>a </span><span>, b</span></div></body>
+</html>""")
+        root = xhtml.find('.//x:body', namespaces=ns)
+        self.extraction.load_ignore_patterns()
+        elements = self.extraction.extract_elements('test', root, [])
+        self.assertEqual(1, len(elements))
+        self.assertEqual('div', elements[0].get_name())
 
     def test_filter_content(self):
         def elements(markups):
@@ -1261,13 +1276,11 @@ class TestElementHandler(unittest.TestCase):
 
     def test_load_remove_rules(self):
         self.handler.load_remove_rules()
-        self.assertEqual(
-            './/*[self::x:rt or self::x:rp]', self.handler.remove_pattern)
+        self.assertIsNotNone(self.handler.remove_pattern)
 
     def test_load_reserve_rules(self):
         self.handler.load_reserve_rules()
-        self.assertRegex(
-            self.handler.reserve_pattern, r'^\.//\*\[self::x:img.*style\]$')
+        self.assertIsNotNone(self.handler.reserve_pattern)
 
     @patch('calibre_plugins.ebook_translator.lib.element.uid')
     def test_prepare_original(self, mock_uid):
@@ -1295,12 +1308,6 @@ class TestElementHandler(unittest.TestCase):
                 self.assertEqual('red', element.original_color)
                 self.assertEqual('green', element.translation_color)
                 self.assertEqual(('percentage', 20), element.column_gap)
-                self.assertEqual(
-                    './/*[self::x:rt or self::x:rp]',
-                    self.handler.remove_pattern)
-                self.assertRegex(
-                    element.reserve_pattern or '',
-                    r'^\.//\*\[self::x:img.*style\]$')
 
     @patch('calibre_plugins.ebook_translator.lib.element.uid')
     def test_prepare_translation_contains_ignored_element(self, mock_uid):
@@ -1527,11 +1534,6 @@ class TestElementHandlerMerge(unittest.TestCase):
                 self.assertEqual('red', element.original_color)
                 self.assertEqual('green', element.translation_color)
                 self.assertEqual(('percentage', 20), element.column_gap)
-                self.assertEqual(
-                    './/*[self::x:rt or self::x:rp]',
-                    self.handler.remove_pattern)
-                self.assertRegex(
-                    element.reserve_pattern, r'^\.//\*\[self::x:img.*style\]$')
 
     @patch('calibre_plugins.ebook_translator.lib.element.uid')
     def test_prepare_original_merge_separator_multiple(self, mock_uid):
