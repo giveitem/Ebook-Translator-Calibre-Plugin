@@ -344,8 +344,6 @@ class GeminiTranslate(GenAI):
     top_p: float = 1.0
     top_k = 1
     stream = True
-    # Keep conversation context across requests
-    keep_context: bool = False
 
     models: list[str] = []
     # TODO: Handle the default model more appropriately.
@@ -359,10 +357,6 @@ class GeminiTranslate(GenAI):
         self.top_p = self.config.get('top_p', self.top_p)
         self.stream = self.config.get('stream', self.stream)
         self.model = self.config.get('model', self.model)
-        self.keep_context = self.config.get('keep_context', self.keep_context)
-        # Internal conversation state for context retention
-        self._context_messages: list[dict] = []
-        self._pending_input: str | None = None
 
     def _prompt(self, text):
         prompt = self.prompt.replace('<tlang>', self.target_lang)
@@ -404,19 +398,10 @@ class GeminiTranslate(GenAI):
         return {'Content-Type': 'application/json'}
 
     def get_body(self, text):
-        # Remember current input so we can append the response to context later
-        self._pending_input = text
-
-        contents: list[dict] = []
-        if self.keep_context and self._context_messages:
-            contents.extend(self._context_messages)
-        contents.append({
-            "role": "user",
-            "parts": [{"text": self._prompt(text)}]
-        })
-
         return json.dumps({
-            "contents": contents,
+            "contents": [
+                {"role": "user", "parts": [{"text": self._prompt(text)}]},
+            ],
             "generationConfig": {
                 # "stopSequences": ["Test"],
                 # "maxOutputTokens": 2048,
@@ -441,14 +426,6 @@ class GeminiTranslate(GenAI):
                     "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
                     "threshold": "BLOCK_NONE"
                 },
-                {
-                    "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
-                    "threshold": "BLOCK_NONE"
-                },
-                {
-                    "category": "HARM_CATEGORY_UNSPECIFIED",
-                    "threshold": "BLOCK_NONE"
-                },
             ],
         })
 
@@ -456,15 +433,9 @@ class GeminiTranslate(GenAI):
         if self.stream:
             return self._parse_stream(response)
         parts = json.loads(response)['candidates'][0]['content']['parts']
-        text = ''.join([part['text'] for part in parts])
-        # Append to conversation context after a successful completion
-        if self.keep_context and self._pending_input is not None:
-            self._append_context(self._pending_input, text)
-            self._pending_input = None
-        return text
+        return ''.join([part['text'] for part in parts])
 
     def _parse_stream(self, response):
-        buffer = []
         while True:
             try:
                 line = response.readline().decode('utf-8').strip()
@@ -480,25 +451,6 @@ class GeminiTranslate(GenAI):
                 content = candidate['content']
                 if 'parts' in content.keys():
                     for part in content['parts']:
-                        text_part = part['text']
-                        buffer.append(text_part)
-                        yield text_part
+                        yield part['text']
                 if candidate.get('finishReason') == 'STOP':
-                     # Update conversation context when streaming finishes
-                    if self.keep_context and self._pending_input is not None:
-                        full_text = ''.join(buffer)
-                        self._append_context(self._pending_input, full_text)
-                        self._pending_input = None
-                        buffer.clear()
                     break
-
-    def _append_context(self, user_text: str, model_text: str):
-        """Append a user/model exchange to the context history."""
-        self._context_messages.append({
-            "role": "user",
-            "parts": [{"text": user_text}]
-        })
-        self._context_messages.append({
-            "role": "model",
-            "parts": [{"text": model_text}]
-        })
