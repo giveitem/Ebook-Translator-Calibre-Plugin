@@ -20,6 +20,8 @@ from .lib.translation import get_engine_class, get_translator, get_translation
 from .lib.element import get_element_handler
 from .lib.conversion import extract_item, extra_formats
 from .engines.openai import ChatgptTranslate, ChatgptBatchTranslate
+from .engines.openrouter import OpenRouterTranslate, OpenRouterBatchTranslate
+from .engines.google import GeminiTranslate, GeminiBatchTranslate
 from .engines.custom import CustomTranslate
 from .components import (
     EngineList, Footer, SourceLang, TargetLang, InputFormat, OutputFormat,
@@ -719,7 +721,13 @@ class AdvancedTranslation(QDialog):
         delete_button = QPushButton(_('Delete'))
         delete_button.setToolTip(delete_button.text() + ' [Del]')
         batch_translation = QPushButton(
-            ' %s (%s)' % (_('Batch Translation'), _('Beta')))
+            ' %s (%s)' % (_('Batch All'), _('Beta')))
+        batch_translation.setToolTip(_(
+            'Batch translate all untranslated paragraphs.'))
+        batch_selected = QPushButton(
+            ' %s (%s)' % (_('Batch Selected'), _('Beta')))
+        batch_selected.setToolTip(_(
+            'Batch translate the selected paragraphs.'))
         translate_all = QPushButton('  %s  ' % _('Translate All'))
         translate_selected = QPushButton('  %s  ' % _('Translate Selected'))
 
@@ -730,6 +738,7 @@ class AdvancedTranslation(QDialog):
         action_layout.addWidget(delete_button)
         action_layout.addStretch(1)
         action_layout.addWidget(batch_translation)
+        action_layout.addWidget(batch_selected)
         action_layout.addWidget(translate_all)
         action_layout.addWidget(translate_selected)
 
@@ -742,26 +751,55 @@ class AdvancedTranslation(QDialog):
 
         delete_button.setDisabled(True)
         translate_selected.setDisabled(True)
+        batch_selected.setDisabled(True)
 
-        self.batch_translation.connect(
-            lambda: batch_translation.setVisible(
-                self.current_engine == ChatgptTranslate))
+        batch_translators = {
+            ChatgptTranslate: ChatgptBatchTranslate,
+            OpenRouterTranslate: OpenRouterBatchTranslate,
+            GeminiTranslate: GeminiBatchTranslate,
+        }
+
+        def toggle_batch_buttons():
+            visible = self.current_engine in batch_translators
+            batch_translation.setVisible(visible)
+            batch_selected.setVisible(visible)
+        self.batch_translation.connect(toggle_batch_buttons)
         self.batch_translation.emit()
 
-        def start_batch_translation():
+        def start_batch_translation(select_all=True):
+            if select_all:
+                paragraphs = self.table.get_selected_paragraphs(True, True)
+            else:
+                paragraphs = self.table.get_selected_paragraphs()
             translator = get_translator(self.current_engine)
             translator.set_source_lang(self.ebook.source_lang)
             translator.set_target_lang(self.ebook.target_lang)
-            batch_translator = ChatgptBatchTranslate(translator)
+            if OpenRouterBatchTranslate.matches(translator):
+                batch_cls = OpenRouterBatchTranslate
+            else:
+                batch_cls = batch_translators[self.current_engine]
+            prefix = getattr(batch_cls, 'cache_prefix', 'chatgpt')
+            has_batch = self.cache.get_info('%s_batch_id' % prefix) is not None
+            if not has_batch and len(paragraphs) < 1:
+                self.alert.pop(
+                    _('There is no content that needs to be translated.'),
+                    'warning')
+                return
+            batch_translator = batch_cls(translator)
             batch = ChatgptBatchTranslationManager(
-                batch_translator, self.cache, self.table, self)
+                batch_translator, self.cache, self.table, self,
+                select_all=select_all)
             batch.exec_()
-        batch_translation.clicked.connect(start_batch_translation)
+        batch_translation.clicked.connect(
+            lambda: start_batch_translation(True))
+        batch_selected.clicked.connect(
+            lambda: start_batch_translation(False))
 
         def item_selection_changed():
             disabled = self.table.selected_count() < 1
             delete_button.setDisabled(disabled)
             translate_selected.setDisabled(disabled)
+            batch_selected.setDisabled(disabled)
         item_selection_changed()
         self.table.itemSelectionChanged.connect(item_selection_changed)
 

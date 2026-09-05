@@ -16,7 +16,11 @@ from ...lib.exception import UnexpectedResult, UnsupportedModel
 from ...engines.genai import GenAI
 from ...engines.deepl import DeeplTranslate
 from ...engines.openai import ChatgptTranslate, ChatgptBatchTranslate
-from ...engines.microsoft import AzureChatgptTranslate
+from ...engines.openrouter import OpenRouterTranslate, OpenRouterBatchTranslate
+from ...engines.google import GeminiTranslate, GeminiBatchTranslate
+from ...engines.microsoft import (
+    AzureChatgptTranslate, MicrosoftFoundryTranslate)
+from ...engines.deepseek import DeepseekTranslate
 from ...engines.anthropic import ClaudeTranslate
 from ...engines.custom import (
     create_engine_template, load_engine_data, CustomTranslate)
@@ -461,6 +465,14 @@ class TestChatgptTranslate(unittest.TestCase):
             headers=self.translator.get_headers(),
             proxy_uri=self.translator.proxy_uri)
 
+    def test_api_root(self):
+        self.assertEqual(
+            self.translator.api_root(), 'https://api.openai.com')
+        self.translator.endpoint = (
+            'https://openrouter.ai/api/v1/chat/completions')
+        self.assertEqual(
+            self.translator.api_root(), 'https://openrouter.ai/api')
+
     def test_get_body(self):
         model = 'gpt-4o'
         self.assertEqual(
@@ -827,6 +839,490 @@ class TestChatgptBatchTranslate(unittest.TestCase):
             proxy_uri=self.mock_translator.proxy_uri)
 
 
+class TestOpenRouterTranslate(unittest.TestCase):
+    def setUp(self):
+        OpenRouterTranslate.set_config({'api_keys': ['a']})
+        OpenRouterTranslate.lang_codes = {
+            'source': {'English': 'EN'}, 'target': {'Chinese': 'ZH'}}
+        self.translator = OpenRouterTranslate()
+        self.translator.set_source_lang('English')
+        self.translator.set_target_lang('Chinese')
+
+    def test_created_engine(self):
+        self.assertIsInstance(self.translator, ChatgptTranslate)
+        self.assertEqual(
+            self.translator.endpoint,
+            'https://openrouter.ai/api/v1/chat/completions')
+        self.assertEqual(self.translator.model, 'openai/gpt-4o')
+        self.assertEqual(
+            self.translator.api_root(), 'https://openrouter.ai/api')
+
+    @patch(module_name + '.openai.EbookTranslator')
+    def test_get_headers(self, mock_et):
+        mock_et.__version__ = '1.0.0'
+        headers = self.translator.get_headers()
+        self.assertEqual(headers['Authorization'], 'Bearer a')
+        self.assertEqual(
+            headers['HTTP-Referer'], 'https://translator.bookfere.com')
+        self.assertEqual(headers['X-Title'], 'Ebook Translator')
+
+    @patch(module_name + '.openai.request')
+    def test_get_models(self, mock_request):
+        mock_request.return_value = json.dumps({
+            'data': [{'id': 'openai/gpt-4o'}, {'id': 'google/gemini-2.5-flash'}]
+        })
+        self.assertEqual(
+            self.translator.get_models(),
+            ['openai/gpt-4o', 'google/gemini-2.5-flash'])
+        mock_request.assert_called_once_with(
+            'https://openrouter.ai/api/v1/models',
+            headers=self.translator.get_headers(),
+            proxy_uri=self.translator.proxy_uri)
+
+
+class TestOpenRouterBatchTranslate(unittest.TestCase):
+    def setUp(self):
+        self.mock_translator = Mock(OpenRouterTranslate)
+        self.mock_translator.endpoint = (
+            'https://openrouter.ai/api/v1/chat/completions')
+        self.mock_translator.proxy_uri = {}
+        self.mock_translator.api_key = 'or-key'
+        self.mock_translator.model = 'openai/gpt-4o'
+        self.mock_headers = {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer or-key',
+            'User-Agent': 'Ebook-Translator/v1.0.0',
+            'HTTP-Referer': 'https://translator.bookfere.com',
+            'X-Title': 'Ebook Translator',
+        }
+        self.mock_translator.get_headers.return_value = dict(self.mock_headers)
+        self.batch_translator = OpenRouterBatchTranslate(self.mock_translator)
+
+    def _mock_get_body(self, text):
+        return json.dumps({
+            'model': 'openai/gpt-4o',
+            'messages': [
+                {'role': 'system', 'content': 'prompt'},
+                {'role': 'user', 'content': text}],
+            'temperature': 1.0,
+        })
+
+    def test_matches(self):
+        self.assertTrue(OpenRouterBatchTranslate.matches(
+            self.mock_translator))
+        other = Mock()
+        other.endpoint = 'https://api.openai.com/v1/chat/completions'
+        self.assertFalse(OpenRouterBatchTranslate.matches(other))
+
+    def test_created_translator(self):
+        self.assertFalse(self.mock_translator.stream)
+        self.assertEqual(
+            self.batch_translator.batch_endpoint,
+            'https://openrouter.ai/api/beta/batches')
+        self.assertEqual(self.batch_translator.inline_file_id, 'inline')
+
+    @patch(module_name + '.openrouter.request')
+    def test_upload_and_create(self, mock_request):
+        mock_request.return_value = json.dumps({'id': 'batch_123'})
+        self.mock_translator.get_body.side_effect = self._mock_get_body
+
+        mock_paragraph_1 = Mock(Paragraph)
+        mock_paragraph_1.md5 = 'abc'
+        mock_paragraph_1.original = 'test content 1'
+        mock_paragraph_2 = Mock(Paragraph)
+        mock_paragraph_2.md5 = 'def'
+        mock_paragraph_2.original = 'test content 2'
+
+        file_id = self.batch_translator.upload(
+            [mock_paragraph_1, mock_paragraph_2])
+        self.assertEqual(file_id, 'inline')
+        mock_request.assert_not_called()
+
+        batch_id = self.batch_translator.create(file_id)
+        self.assertEqual(batch_id, 'batch_123')
+        body = mock_request.call_args[0][1]
+        self.assertLess(body.index('"endpoint"'), body.index('"requests"'))
+        self.assertLess(body.index('"model"'), body.index('"requests"'))
+        payload = json.loads(body)
+        self.assertEqual(payload['endpoint'], '/v1/chat/completions')
+        self.assertEqual(payload['model'], 'openai/gpt-4o')
+        self.assertEqual(payload['completion_window'], '24h')
+        self.assertEqual(payload['requests'][0]['custom_id'], 'abc')
+        self.assertEqual(
+            payload['requests'][0]['body']['messages'][1]['content'],
+            'test content 1')
+        mock_request.assert_called_once_with(
+            'https://openrouter.ai/api/beta/batches',
+            body, self.mock_headers, 'POST',
+            proxy_uri=self.mock_translator.proxy_uri)
+
+    @patch(module_name + '.openrouter.request')
+    def test_check_and_retrieve(self, mock_request):
+        mock_request.return_value = json.dumps({
+            'id': 'batch_123',
+            'status': 'completed',
+            'request_counts': {
+                'total': 2, 'completed': 2, 'failed': 0},
+            'results': [
+                {
+                    'custom_id': 'abc',
+                    'response': {
+                        'status_code': 200,
+                        'body': {
+                            'choices': [{
+                                'message': {'content': 'A'}
+                            }]
+                        }
+                    },
+                    'error': None,
+                },
+                {
+                    'custom_id': 'def',
+                    'response': {
+                        'status_code': 200,
+                        'body': {
+                            'choices': [{
+                                'message': {'content': 'B'}
+                            }]
+                        }
+                    },
+                    'error': None,
+                },
+            ],
+            'error': None,
+        })
+
+        def mock_get_result(response):
+            data = json.loads(response)
+            return data['choices'][0]['message']['content']
+        self.mock_translator.get_result.side_effect = mock_get_result
+
+        info = self.batch_translator.check('batch_123')
+        self.assertEqual(info['status'], 'completed')
+        self.assertEqual(
+            self.batch_translator.retrieve(None),
+            {'abc': 'A', 'def': 'B'})
+        mock_request.assert_called_once_with(
+            'https://openrouter.ai/api/beta/batches/batch_123',
+            headers=self.mock_headers,
+            proxy_uri=self.mock_translator.proxy_uri)
+
+    @patch(module_name + '.openrouter.request')
+    def test_cancel(self, mock_request):
+        mock_request.return_value = json.dumps({'status': 'cancelling'})
+        self.assertTrue(self.batch_translator.cancel('batch_123'))
+        mock_request.assert_called_once_with(
+            'https://openrouter.ai/api/beta/batches/batch_123/cancel',
+            headers=self.mock_headers, method='POST',
+            proxy_uri=self.mock_translator.proxy_uri)
+
+    def test_delete(self):
+        self.assertTrue(self.batch_translator.delete('inline'))
+
+
+class TestGeminiBatchTranslate(unittest.TestCase):
+    def setUp(self):
+        self.mock_translator = Mock(GeminiTranslate)
+        self.mock_translator.endpoint = (
+            'https://generativelanguage.googleapis.com/v1beta/models')
+        self.mock_translator.proxy_uri = {}
+        self.mock_translator.api_key = 'test-key'
+        self.mock_translator.model = 'gemini-2.5-flash'
+        self.mock_translator.request_timeout = 30.0
+        self.mock_headers = {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': 'test-key'}
+        self.batch_translator = GeminiBatchTranslate(self.mock_translator)
+
+    def _mock_get_body(self, text):
+        return json.dumps({
+            'contents': [{'role': 'user', 'parts': [{'text': text}]}],
+            'generationConfig': {
+                'temperature': 0.9, 'topP': 1.0, 'topK': 1},
+        })
+
+    def test_created_translator(self):
+        self.assertIsInstance(self.batch_translator, GeminiBatchTranslate)
+        self.assertIs(self.mock_translator, self.batch_translator.translator)
+        self.assertFalse(self.mock_translator.stream)
+        self.assertEqual(
+            self.batch_translator.api_base,
+            'https://generativelanguage.googleapis.com/v1beta')
+        self.assertEqual(
+            self.batch_translator.models_endpoint,
+            'https://generativelanguage.googleapis.com/v1beta/models')
+        self.assertEqual(
+            self.batch_translator.upload_endpoint,
+            'https://generativelanguage.googleapis.com/upload/v1beta/files')
+        self.assertEqual(
+            self.batch_translator.download_base,
+            'https://generativelanguage.googleapis.com/download/v1beta')
+
+    def test_supported_models(self):
+        self.mock_translator.get_models.return_value = [
+            'gemini-2.5-flash', 'gemini-2.5-pro']
+        self.assertEqual(
+            self.batch_translator.supported_models(),
+            ['gemini-2.5-flash', 'gemini-2.5-pro'])
+
+    @patch(module_name + '.google.GeminiBatchTranslate.supported_models')
+    def test_upload_with_unsupported_model(self, mock_supported_models):
+        mock_supported_models.return_value = ['gemini-2.5-flash']
+        self.mock_translator.model = 'fake-model'
+        with self.assertRaises(UnsupportedModel) as cm:
+            self.batch_translator.upload([Mock(Paragraph)])
+        self.assertEqual(
+            str(cm.exception),
+            'The model "fake-model" does not support batch functionality.')
+
+    @patch(module_name + '.google.GeminiBatchTranslate.supported_models')
+    @patch(module_name + '.google.request')
+    def test_upload_inline(self, mock_request, mock_supported_models):
+        mock_supported_models.return_value = ['gemini-2.5-flash']
+        self.mock_translator.get_body.side_effect = self._mock_get_body
+
+        mock_paragraph_1 = Mock(Paragraph)
+        mock_paragraph_1.md5 = 'abc'
+        mock_paragraph_1.original = 'test content 1'
+        mock_paragraph_2 = Mock(Paragraph)
+        mock_paragraph_2.md5 = 'def'
+        mock_paragraph_2.original = 'test content 2'
+
+        file_id = self.batch_translator.upload(
+            [mock_paragraph_1, mock_paragraph_2])
+
+        self.assertEqual(file_id, 'inline')
+        mock_request.assert_not_called()
+        self.assertEqual(len(self.batch_translator._inlined_requests), 2)
+        self.assertEqual(
+            self.batch_translator._inlined_requests[0]['metadata']['key'],
+            'abc')
+
+    @patch.object(GeminiBatchTranslate, 'inline_size_limit', 1)
+    @patch(module_name + '.google.GeminiBatchTranslate.supported_models')
+    @patch(module_name + '.google.request')
+    def test_upload_file(self, mock_request, mock_supported_models):
+        mock_supported_models.return_value = ['gemini-2.5-flash']
+        self.mock_translator.get_body.side_effect = self._mock_get_body
+
+        mock_start = Mock()
+        mock_start.info.return_value.get.side_effect = (
+            lambda key, default=None: (
+                'https://example.com/upload-url'
+                if 'upload-url' in key.lower() else default))
+        mock_request.side_effect = [
+            mock_start,
+            json.dumps({'file': {'name': 'files/test-file-id'}}),
+        ]
+
+        mock_paragraph = Mock(Paragraph)
+        mock_paragraph.md5 = 'abc'
+        mock_paragraph.original = 'test content 1'
+
+        file_id = self.batch_translator.upload([mock_paragraph])
+
+        self.assertEqual(file_id, 'files/test-file-id')
+        self.assertEqual(mock_request.call_count, 2)
+        start_call = mock_request.call_args_list[0]
+        self.assertEqual(
+            start_call[0][0],
+            'https://generativelanguage.googleapis.com/upload/v1beta/files')
+        self.assertEqual(start_call[0][3], 'POST')
+        self.assertTrue(start_call[1].get('raw_object'))
+        upload_call = mock_request.call_args_list[1]
+        self.assertEqual(upload_call[0][0], 'https://example.com/upload-url')
+        self.assertIn(b'"key": "abc"', upload_call[0][1])
+        self.assertEqual(
+            upload_call[0][2]['X-Goog-Upload-Command'], 'upload, finalize')
+
+    @patch(module_name + '.google.request')
+    def test_delete_inline(self, mock_request):
+        self.assertTrue(self.batch_translator.delete('inline'))
+        mock_request.assert_not_called()
+
+    @patch(module_name + '.google.request')
+    def test_delete(self, mock_request):
+        mock_request.return_value = '{}'
+        self.assertTrue(self.batch_translator.delete('files/test-file-id'))
+        mock_request.assert_called_once_with(
+            'https://generativelanguage.googleapis.com/v1beta/files/'
+            'test-file-id',
+            headers=self.mock_headers, method='DELETE',
+            proxy_uri=self.mock_translator.proxy_uri)
+
+    @patch(module_name + '.google.request')
+    def test_retrieve_file(self, mock_request):
+        line_1 = (
+            b'{"key":"abc","response":{"candidates":[{"content":{"parts":'
+            b'[{"text":"A"}]}}]}}')
+        line_2 = (
+            b'{"key":"def","response":{"candidates":[{"content":{"parts":'
+            b'[{"thought":true,"text":"..."},{"text":"B"}]}}]}}')
+        mock_request.return_value.read.return_value = line_1 + b'\n' + line_2
+
+        self.assertEqual(
+            self.batch_translator.retrieve('files/test-file-id'),
+            {'abc': 'A', 'def': 'B'})
+
+        headers = {'x-goog-api-key': 'test-key'}
+        mock_request.assert_called_once_with(
+            'https://generativelanguage.googleapis.com/download/v1beta/'
+            'files/test-file-id:download?alt=media',
+            headers=headers, raw_object=True,
+            proxy_uri=self.mock_translator.proxy_uri)
+
+    def test_retrieve_inlined(self):
+        self.batch_translator._latest = {
+            'dest': {
+                'inlinedResponses': [
+                    {
+                        'metadata': {'key': 'abc'},
+                        'response': {
+                            'candidates': [{
+                                'content': {'parts': [{'text': 'A'}]}
+                            }]
+                        }
+                    },
+                    {
+                        'key': 'def',
+                        'response': {
+                            'candidates': [{
+                                'content': {'parts': [{'text': 'B'}]}
+                            }]
+                        }
+                    },
+                ]
+            }
+        }
+        self.assertEqual(
+            self.batch_translator.retrieve(None),
+            {'abc': 'A', 'def': 'B'})
+
+    @patch(module_name + '.google.request')
+    def test_create_inline(self, mock_request):
+        mock_request.return_value = json.dumps({
+            'name': 'batches/test-batch-id'})
+        self.batch_translator._inlined_requests = [{
+            'request': {'contents': []},
+            'metadata': {'key': 'abc'},
+        }]
+
+        self.assertEqual(
+            self.batch_translator.create('inline'), 'batches/test-batch-id')
+
+        body = json.dumps({
+            'batch': {
+                'display_name': 'ebook-translator',
+                'input_config': {
+                    'requests': {
+                        'requests': self.batch_translator._inlined_requests,
+                    }
+                }
+            }
+        })
+        mock_request.assert_called_once_with(
+            'https://generativelanguage.googleapis.com/v1beta/models/'
+            'gemini-2.5-flash:batchGenerateContent',
+            body, self.mock_headers, 'POST',
+            proxy_uri=self.mock_translator.proxy_uri)
+
+    @patch(module_name + '.google.request')
+    def test_create_file(self, mock_request):
+        mock_request.return_value = json.dumps({
+            'name': 'batches/test-batch-id'})
+
+        self.assertEqual(
+            self.batch_translator.create('files/test-file-id'),
+            'batches/test-batch-id')
+
+        body = json.dumps({
+            'batch': {
+                'display_name': 'ebook-translator',
+                'input_config': {
+                    'file_name': 'files/test-file-id',
+                }
+            }
+        })
+        mock_request.assert_called_once_with(
+            'https://generativelanguage.googleapis.com/v1beta/models/'
+            'gemini-2.5-flash:batchGenerateContent',
+            body, self.mock_headers, 'POST',
+            proxy_uri=self.mock_translator.proxy_uri)
+
+    @patch(module_name + '.google.request')
+    def test_check(self, mock_request):
+        mock_response = {
+            'name': 'batches/test-batch-id',
+            'done': True,
+            'metadata': {
+                'state': 'JOB_STATE_SUCCEEDED',
+                'batchStats': {
+                    'requestCount': '2',
+                    'successfulRequestCount': '2',
+                    'failedRequestCount': '0',
+                }
+            },
+            'response': {
+                'responsesFile': 'files/output-id',
+            }
+        }
+        mock_request.return_value = json.dumps(mock_response)
+
+        self.assertEqual(
+            self.batch_translator.check('batches/test-batch-id'),
+            {
+                'status': 'completed',
+                'output_file_id': 'files/output-id',
+                'request_counts': {
+                    'total': 2,
+                    'completed': 2,
+                    'failed': 0,
+                },
+                'errors': None,
+            })
+        mock_request.assert_called_once_with(
+            'https://generativelanguage.googleapis.com/v1beta/'
+            'batches/test-batch-id',
+            headers=self.mock_headers,
+            proxy_uri=self.mock_translator.proxy_uri)
+
+    @patch(module_name + '.google.request')
+    def test_check_dest_format(self, mock_request):
+        mock_request.return_value = json.dumps({
+            'name': 'batches/test-batch-id',
+            'state': 'BATCH_STATE_RUNNING',
+            'dest': {'fileName': 'files/output-id'},
+            'batchStats': {
+                'requestCount': 10,
+                'successfulRequestCount': 3,
+                'failedRequestCount': 1,
+            }
+        })
+        self.assertEqual(
+            self.batch_translator.check('test-batch-id'),
+            {
+                'status': 'in_progress',
+                'output_file_id': 'files/output-id',
+                'request_counts': {
+                    'total': 10,
+                    'completed': 3,
+                    'failed': 1,
+                },
+                'errors': None,
+            })
+
+    @patch(module_name + '.google.request')
+    def test_cancel(self, mock_request):
+        mock_request.return_value = '{}'
+        self.assertTrue(
+            self.batch_translator.cancel('batches/test-batch-id'))
+        mock_request.assert_called_once_with(
+            'https://generativelanguage.googleapis.com/v1beta/'
+            'batches/test-batch-id:cancel',
+            headers=self.mock_headers, method='POST',
+            proxy_uri=self.mock_translator.proxy_uri)
+
+
 class TestAzureChatgptTranslate(unittest.TestCase):
     def setUp(self):
         AzureChatgptTranslate.set_config({'api_keys': ['a', 'b', 'c']})
@@ -884,6 +1380,88 @@ class TestAzureChatgptTranslate(unittest.TestCase):
             proxy_uri=None, raw_object=True)
         self.assertIsInstance(result, GeneratorType)
         self.assertEqual('你好世界！', ''.join(result))
+
+
+class TestDeepseekTranslate(unittest.TestCase):
+    def setUp(self):
+        DeepseekTranslate.set_config({'api_keys': ['a', 'b', 'c']})
+        DeepseekTranslate.lang_codes = {
+            'source': {'English': 'EN'}, 'target': {'Chinese': 'ZH'}}
+
+        self.translator = DeepseekTranslate()
+        self.translator.set_source_lang('English')
+        self.translator.set_target_lang('Chinese')
+
+    def test_created_engine(self):
+        self.assertIsInstance(self.translator, ChatgptTranslate)
+        self.assertTrue(self.translator.thinking)
+
+    def test_get_body_with_thinking_enabled(self):
+        body = json.loads(self.translator.get_body('test content'))
+        self.assertEqual(body['thinking'], {'type': 'enabled'})
+        self.assertEqual(body['model'], 'deepseek-chat')
+
+    def test_get_body_with_thinking_disabled(self):
+        self.translator.thinking = False
+        body = json.loads(self.translator.get_body('test content'))
+        self.assertEqual(body['thinking'], {'type': 'disabled'})
+
+
+class TestMicrosoftFoundryTranslate(unittest.TestCase):
+    def setUp(self):
+        MicrosoftFoundryTranslate.set_config({
+            'api_keys': ['test-key|eastus']})
+        MicrosoftFoundryTranslate.lang_codes = {
+            'source': {'English': 'en'},
+            'target': {'Chinese Simplified': 'zh-Hans'}}
+
+        self.translator = MicrosoftFoundryTranslate()
+        self.translator.set_source_lang('English')
+        self.translator.set_target_lang('Chinese Simplified')
+
+    def test_created_engine(self):
+        self.assertIsInstance(self.translator, Base)
+
+    @patch(module_name + '.microsoft.uuid.uuid4')
+    @patch(module_name + '.base.request')
+    def test_translate(self, mock_request, mock_uuid4):
+        mock_uuid4.return_value = 'trace-id'
+        mock_request.return_value = json.dumps([{
+            'translations': [{'text': '你好世界！', 'to': 'zh-Hans'}]}])
+
+        self.assertEqual('你好世界！', self.translator.translate('Hello World!'))
+
+        mock_request.assert_called_once_with(
+            url=('https://api.cognitive.microsofttranslator.com/translate?'
+                 'api-version=3.0&to=zh-Hans&from=en'),
+            data='[{"Text": "Hello World!"}]',
+            headers={
+                'Content-Type': 'application/json; charset=UTF-8',
+                'Ocp-Apim-Subscription-Key': 'test-key',
+                'X-ClientTraceId': 'trace-id',
+                'Ocp-Apim-Subscription-Region': 'eastus',
+            },
+            method='POST', timeout=10.0, proxy_uri=None, raw_object=False)
+
+    @patch(module_name + '.microsoft.uuid.uuid4')
+    def test_global_resource_headers(self, mock_uuid4):
+        mock_uuid4.return_value = 'trace-id'
+        self.translator.api_key = 'global-key'
+
+        self.assertEqual({
+            'Content-Type': 'application/json; charset=UTF-8',
+            'Ocp-Apim-Subscription-Key': 'global-key',
+            'X-ClientTraceId': 'trace-id',
+        }, self.translator.get_headers())
+
+    def test_custom_endpoint(self):
+        self.translator.api_key = (
+            'test-key|eastus|https://example.cognitiveservices.azure.com')
+
+        self.assertEqual(
+            'https://example.cognitiveservices.azure.com/translator/text/v3.0/'
+            'translate?api-version=3.0&to=zh-Hans&from=en',
+            self.translator.get_endpoint())
 
 
 class TestClaudeTranslate(unittest.TestCase):

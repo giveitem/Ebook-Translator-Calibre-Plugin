@@ -17,7 +17,8 @@ from .lib.utils import (
     log, css, is_proxy_available, traceback_error, socks_proxy)
 from .lib.translation import get_engine_class, get_translator
 from .engines import (
-    builtin_engines, GeminiTranslate, ChatgptTranslate, AzureChatgptTranslate)
+    builtin_engines, GeminiTranslate, ChatgptTranslate, AzureChatgptTranslate,
+    DeepseekTranslate)
 from .engines.genai import GenAI
 from .engines.custom import CustomTranslate
 from .components import (
@@ -49,7 +50,7 @@ class ModelWorker(QObject):
         except Exception:
             error = traceback_error()
             self.log.error('Failed to fetch models: %s' % error)
-            self.success.emit(False, error)
+            self.success.emit(True, '')
         self.finished.emit()
 
 
@@ -557,6 +558,12 @@ class TranslationSetting(QDialog):
         stream_enabled = QCheckBox(_('Enable streaming response'))
         genai_layout.addRow(_('Stream'), stream_enabled)
 
+        thinking_label = QLabel(_('Thinking'))
+        thinking_enabled = QCheckBox(_('Enable thinking mode'))
+        thinking_label.setVisible(False)
+        thinking_enabled.setVisible(False)
+        genai_layout.addRow(thinking_label, thinking_enabled)
+
         sampling_btn_group = QButtonGroup(sampling_widget)
         sampling_btn_group.addButton(temperature, 0)
         sampling_btn_group.addButton(top_p, 1)
@@ -703,6 +710,15 @@ class TranslationSetting(QDialog):
                 config.get('stream', self.current_engine.stream))
             stream_enabled.toggled.connect(
                 lambda checked: config.update(stream=checked))
+            # Thinking (DeepSeek)
+            is_deepseek = issubclass(self.current_engine, DeepseekTranslate)
+            thinking_label.setVisible(is_deepseek)
+            thinking_enabled.setVisible(is_deepseek)
+            if is_deepseek:
+                thinking_enabled.setChecked(
+                    config.get('thinking', self.current_engine.thinking))
+                thinking_enabled.toggled.connect(
+                    lambda checked: config.update(thinking=checked))
             genai_group.setVisible(True)
 
         def choose_default_engine(index):

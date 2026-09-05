@@ -2,11 +2,14 @@ import os
 import sys
 import time
 import json
+import io
 from html import unescape
 from subprocess import Popen, PIPE
 from http.client import IncompleteRead
+from urllib.parse import urlsplit, urlunsplit
 
 from ..lib.utils import request, traceback_error
+from ..lib.exception import UnsupportedModel
 
 from .base import Base
 from .genai import GenAI
@@ -429,11 +432,17 @@ class GeminiTranslate(GenAI):
             ],
         })
 
+    @staticmethod
+    def extract_text(payload):
+        parts = payload['candidates'][0]['content']['parts']
+        return ''.join(
+            part['text'] for part in parts
+            if part.get('text') and not part.get('thought'))
+
     def get_result(self, response):
         if self.stream:
             return self._parse_stream(response)
-        parts = json.loads(response)['candidates'][0]['content']['parts']
-        return ''.join([part['text'] for part in parts])
+        return self.extract_text(json.loads(response))
 
     def _parse_stream(self, response):
         while True:
@@ -451,6 +460,321 @@ class GeminiTranslate(GenAI):
                 content = candidate['content']
                 if 'parts' in content.keys():
                     for part in content['parts']:
-                        yield part['text']
+                        if part.get('text') and not part.get('thought'):
+                            yield part['text']
                 if candidate.get('finishReason') == 'STOP':
                     break
+
+
+class GeminiBatchTranslate:
+    """https://ai.google.dev/gemini-api/docs/batch-api"""
+    alias = 'Gemini'
+    provider = 'Google'
+    docs_url = 'https://ai.google.dev/gemini-api/docs/batch-api'
+    cache_prefix = 'gemini'
+    inline_file_id = 'inline'
+    inline_size_limit = 20 * 1024 * 1024
+    _state_map = {
+        'JOB_STATE_PENDING': 'pending',
+        'JOB_STATE_RUNNING': 'in_progress',
+        'JOB_STATE_SUCCEEDED': 'completed',
+        'JOB_STATE_FAILED': 'failed',
+        'JOB_STATE_CANCELLED': 'cancelled',
+        'JOB_STATE_CANCELED': 'cancelled',
+        'JOB_STATE_EXPIRED': 'expired',
+        'BATCH_STATE_PENDING': 'pending',
+        'BATCH_STATE_RUNNING': 'in_progress',
+        'BATCH_STATE_SUCCEEDED': 'completed',
+        'BATCH_STATE_FAILED': 'failed',
+        'BATCH_STATE_CANCELLED': 'cancelled',
+        'BATCH_STATE_CANCELED': 'cancelled',
+        'BATCH_STATE_EXPIRED': 'expired',
+    }
+
+    def __init__(self, translator):
+        self.translator = translator
+        self.translator.stream = False
+        self._inlined_requests = []
+        self._latest = {}
+
+        models_endpoint = (self.translator.endpoint or '').rstrip('/')
+        if models_endpoint.endswith('/models'):
+            self.api_base = models_endpoint[:-len('/models')]
+            self.models_endpoint = models_endpoint
+        else:
+            self.api_base = models_endpoint or (
+                'https://generativelanguage.googleapis.com/v1beta')
+            self.models_endpoint = '%s/models' % self.api_base
+
+        parts = urlsplit(self.api_base)
+        self.upload_endpoint = urlunsplit((
+            parts.scheme, parts.netloc,
+            '/upload%s/files' % parts.path, '', ''))
+        self.download_base = urlunsplit((
+            parts.scheme, parts.netloc,
+            '/download%s' % parts.path, '', ''))
+
+    def supported_models(self):
+        return self.translator.get_models()
+
+    def headers(self, extra=None):
+        headers = {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': self.translator.api_key or '',
+        }
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def _ensure_prefix(self, name, prefix):
+        if not name:
+            return name
+        if name.startswith('%s/' % prefix):
+            return name
+        return '%s/%s' % (prefix, name)
+
+    def _batch_url(self, batch_id):
+        return '%s/%s' % (
+            self.api_base, self._ensure_prefix(batch_id, 'batches'))
+
+    def _build_requests(self, paragraphs):
+        inlined = []
+        jsonl_lines = []
+        for paragraph in paragraphs:
+            body = json.loads(self.translator.get_body(paragraph.original))
+            inlined.append({
+                'request': body,
+                'metadata': {'key': paragraph.md5},
+            })
+            jsonl_lines.append(json.dumps({
+                'key': paragraph.md5,
+                'request': body,
+            }))
+        return inlined, '\n'.join(jsonl_lines).encode('utf-8')
+
+    def upload(self, paragraphs):
+        """Prepare batch input. Small payloads are sent inline later; larger
+        ones are uploaded as a JSONL file via the Gemini File API.
+        """
+        if self.translator.model not in self.supported_models():
+            raise UnsupportedModel(
+                'The model "{}" does not support batch functionality.'
+                .format(self.translator.model))
+        inlined, jsonl = self._build_requests(paragraphs)
+        self._inlined_requests = inlined
+        inline_body = json.dumps({
+            'batch': {
+                'display_name': 'ebook-translator',
+                'input_config': {
+                    'requests': {'requests': inlined},
+                },
+            }
+        }).encode('utf-8')
+        if len(inline_body) < self.inline_size_limit:
+            return self.inline_file_id
+        return self._upload_jsonl(jsonl)
+
+    def _get_upload_url(self, response):
+        if response is None or not hasattr(response, 'info'):
+            raise Exception(_('Failed to start Gemini batch file upload.'))
+        info = response.info()
+        url = None
+        if hasattr(info, 'get'):
+            url = info.get('X-Goog-Upload-URL') or info.get('x-goog-upload-url')
+        if not url:
+            raise Exception(_('Failed to start Gemini batch file upload.'))
+        return url.strip()
+
+    def _upload_jsonl(self, payload):
+        start_headers = self.headers({
+            'X-Goog-Upload-Protocol': 'resumable',
+            'X-Goog-Upload-Command': 'start',
+            'X-Goog-Upload-Header-Content-Length': str(len(payload)),
+            'X-Goog-Upload-Header-Content-Type': 'application/json',
+        })
+        start_response = request(
+            self.upload_endpoint,
+            json.dumps({'file': {'display_name': 'ebook-translator-batch'}}),
+            start_headers, 'POST', proxy_uri=self.translator.proxy_uri,
+            raw_object=True)
+        upload_url = self._get_upload_url(start_response)
+        upload_headers = {
+            'x-goog-api-key': self.translator.api_key or '',
+            'Content-Length': str(len(payload)),
+            'X-Goog-Upload-Offset': '0',
+            'X-Goog-Upload-Command': 'upload, finalize',
+        }
+        response = request(
+            upload_url, payload, upload_headers, 'POST',
+            proxy_uri=self.translator.proxy_uri)
+        data = json.loads(response)
+        file_info = data.get('file') or data
+        file_id = file_info.get('name')
+        if not file_id:
+            raise Exception(_('Failed to upload Gemini batch input file.'))
+        return file_id
+
+    def create(self, file_id):
+        if file_id == self.inline_file_id:
+            body = json.dumps({
+                'batch': {
+                    'display_name': 'ebook-translator',
+                    'input_config': {
+                        'requests': {
+                            'requests': self._inlined_requests or [],
+                        }
+                    }
+                }
+            })
+        else:
+            body = json.dumps({
+                'batch': {
+                    'display_name': 'ebook-translator',
+                    'input_config': {
+                        'file_name': file_id,
+                    }
+                }
+            })
+        response = request(
+            '%s/%s:batchGenerateContent' % (
+                self.models_endpoint, self.translator.model),
+            body, self.headers(), 'POST',
+            proxy_uri=self.translator.proxy_uri)
+        return json.loads(response).get('name')
+
+    def check(self, batch_id):
+        response = request(
+            self._batch_url(batch_id),
+            headers=self.headers(),
+            proxy_uri=self.translator.proxy_uri)
+        data = json.loads(response)
+        self._latest = data
+        return self._normalize_batch_info(data)
+
+    def _normalize_batch_info(self, data):
+        metadata = data.get('metadata') or {}
+        state = data.get('state') or metadata.get('state') or ''
+        if isinstance(state, dict):
+            state = state.get('name') or ''
+        status = self._state_map.get(state)
+        if status is None:
+            if data.get('error') or metadata.get('error'):
+                status = 'failed'
+            elif data.get('done') is True:
+                status = 'completed'
+            elif data.get('done') is False:
+                status = 'in_progress'
+            else:
+                status = state or 'unknown'
+
+        dest = data.get('dest') or {}
+        output = data.get('output') or data.get('response') or {}
+        output_file_id = (
+            dest.get('fileName') or dest.get('file_name')
+            or output.get('responsesFile') or output.get('responses_file')
+            or output.get('fileName') or output.get('file_name'))
+
+        stats = (
+            data.get('batchStats') or data.get('batch_stats')
+            or metadata.get('batchStats') or metadata.get('batch_stats')
+            or {})
+        request_counts = {
+            'total': int(
+                stats.get('requestCount') or stats.get('request_count') or 0),
+            'completed': int(
+                stats.get('successfulRequestCount')
+                or stats.get('successful_request_count') or 0),
+            'failed': int(
+                stats.get('failedRequestCount')
+                or stats.get('failed_request_count') or 0),
+        }
+        return {
+            'status': status,
+            'output_file_id': output_file_id,
+            'request_counts': request_counts,
+            'errors': (
+                data.get('error') or data.get('errors')
+                or metadata.get('error')),
+        }
+
+    def retrieve(self, output_file_id):
+        if output_file_id and output_file_id != self.inline_file_id:
+            return self._retrieve_file(output_file_id)
+        return self._retrieve_inlined(self._latest or {})
+
+    def _iter_inlined(self, data):
+        dest = data.get('dest') or {}
+        output = data.get('output') or data.get('response') or {}
+        items = dest.get('inlinedResponses') or dest.get('inlined_responses')
+        if items is None:
+            nested = (
+                output.get('inlinedResponses')
+                or output.get('inlined_responses'))
+            if isinstance(nested, dict):
+                items = (
+                    nested.get('inlinedResponses')
+                    or nested.get('inlined_responses'))
+            else:
+                items = nested
+        return items or []
+
+    def _result_item(self, item):
+        if not isinstance(item, dict):
+            return None, None
+        key = item.get('key')
+        metadata = item.get('metadata') or {}
+        if key is None:
+            key = metadata.get('key')
+        response = item.get('response')
+        if not response:
+            return key, None
+        try:
+            return key, GeminiTranslate.extract_text(response)
+        except (KeyError, IndexError, TypeError):
+            return key, None
+
+    def _retrieve_inlined(self, data):
+        translations = {}
+        for item in self._iter_inlined(data):
+            key, text = self._result_item(item)
+            if key and text:
+                translations[key] = text
+        return translations
+
+    def _retrieve_file(self, file_id):
+        file_name = self._ensure_prefix(file_id, 'files')
+        headers = self.headers()
+        del headers['Content-Type']
+        response = request(
+            '%s/%s:download?alt=media' % (self.download_base, file_name),
+            headers=headers, raw_object=True,
+            proxy_uri=self.translator.proxy_uri)
+        payload = response.read() if hasattr(response, 'read') else response
+        if isinstance(payload, str):
+            payload = payload.encode('utf-8')
+
+        translations = {}
+        for line in io.BytesIO(payload):
+            if not line.strip():
+                continue
+            key, text = self._result_item(json.loads(line))
+            if key and text:
+                translations[key] = text
+        return translations
+
+    def cancel(self, batch_id):
+        request(
+            '%s:cancel' % self._batch_url(batch_id),
+            headers=self.headers(), method='POST',
+            proxy_uri=self.translator.proxy_uri)
+        return True
+
+    def delete(self, file_id):
+        if not file_id or file_id == self.inline_file_id:
+            return True
+        request(
+            '%s/%s' % (
+                self.api_base, self._ensure_prefix(file_id, 'files')),
+            headers=self.headers(), method='DELETE',
+            proxy_uri=self.translator.proxy_uri)
+        return True

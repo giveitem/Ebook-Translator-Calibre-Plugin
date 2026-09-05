@@ -63,9 +63,17 @@ class ChatgptTranslate(GenAI):
         self.stream = self.config.get('stream', self.stream)
         self.model = self.config.get('model', self.model)
 
+    def api_root(self):
+        """Return the API root used for /v1/models and related paths."""
+        parts = urlsplit(self.endpoint or '', 'https')
+        origin = '%s://%s' % (parts.scheme or 'https', parts.netloc)
+        path = parts.path or ''
+        if path.startswith('/api/') or path.rstrip('/') == '/api':
+            return '%s/api' % origin
+        return origin
+
     def get_models(self):
-        domain_name = '://'.join(urlsplit(self.endpoint or '', 'https')[:2])
-        model_endpoint = '%s/v1/models' % domain_name
+        model_endpoint = '%s/v1/models' % self.api_root()
         response = request(
             model_endpoint, headers=self.get_headers(),
             proxy_uri=self.proxy_uri)
@@ -185,6 +193,10 @@ class ChatgptTranslate(GenAI):
 
 class ChatgptBatchTranslate:
     """https://cookbook.openai.com/examples/batch_processing"""
+    alias = 'ChatGPT'
+    provider = 'OpenAI'
+    docs_url = 'https://cookbook.openai.com/examples/batch_processing'
+    cache_prefix = 'chatgpt'
     boundary = uuid.uuid4().hex
 
     def __init__(self, translator):

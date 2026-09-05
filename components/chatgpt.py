@@ -72,7 +72,8 @@ class ChatgptBatchTranslationWorker(QObject):
     def create_batch(self):
         self.process_tip.emit(_('processing...'))
         self.stack_index.emit(1)
-        if self._file_id is None:
+        inline_id = getattr(self._batch_translator, 'inline_file_id', None)
+        if self._file_id is None or self._file_id == inline_id:
             self._file_id = self._batch_translator.upload(self._paragraphs)
             log.debug('A new file was uploaded: %s' % self._file_id)
             self.save_file_id.emit(self._file_id)
@@ -128,9 +129,17 @@ class ChatgptBatchTranslationWorker(QObject):
 class ChatgptBatchTranslationManager(QDialog):
     batch_thread = QThread()
 
-    def __init__(self, translator, cache, table, parent=None):
+    def __init__(
+            self, translator, cache, table, parent=None, select_all=True):
         QDialog.__init__(self, parent=parent)
-        self.setWindowTitle(_('ChatGPT Batch Translation'))
+        self.batch_name = getattr(translator, 'alias', 'ChatGPT')
+        self.provider = getattr(translator, 'provider', 'OpenAI')
+        self.docs_url = getattr(
+            translator, 'docs_url',
+            'https://cookbook.openai.com/examples/batch_processing')
+        self.cache_prefix = getattr(translator, 'cache_prefix', 'chatgpt')
+        self.select_all = select_all
+        self.setWindowTitle(_('%s Batch Translation') % self.batch_name)
         self.setMinimumWidth(500)
         self.setMinimumHeight(300)
         # self.setModal(True)
@@ -154,33 +163,41 @@ class ChatgptBatchTranslationManager(QDialog):
 
         self.batch_worker.stack_index.connect(self.stack.setCurrentIndex)
 
-        self.batch_id = self.cache.get_info('chatgpt_batch_id')
-        self.file_id = self.cache.get_info('chatgpt_file_id')
+        self.batch_id = self.cache.get_info('%s_batch_id' % self.cache_prefix)
+        self.file_id = self.cache.get_info('%s_file_id' % self.cache_prefix)
 
         log.debug('Initialized batch id: %s' % self.batch_id)
         log.debug('Initialized file id: %s' % self.file_id)
 
-        self.batch_worker.set_paragraphs(
-            self.table.get_selected_paragraphs(True, True))
+        if self.batch_id is not None:
+            # Resume applies whatever the job returned, not the current
+            # table selection.
+            paragraphs = self.table.get_selected_paragraphs(False, True)
+        elif self.select_all:
+            paragraphs = self.table.get_selected_paragraphs(True, True)
+        else:
+            paragraphs = self.table.get_selected_paragraphs()
+        self.paragraph_count = len(paragraphs)
+        self.batch_worker.set_paragraphs(paragraphs)
         self.batch_worker.set_batch_id(self.batch_id)
         self.batch_worker.set_file_id(self.file_id)
 
         def set_batch_id(batch_id):
             self.batch_id = batch_id
-            self.cache.set_info('chatgpt_batch_id', batch_id)
+            self.cache.set_info('%s_batch_id' % self.cache_prefix, batch_id)
             log.debug('A new batch id was stored: %s' % batch_id)
         self.batch_worker.save_batch_id.connect(set_batch_id)
 
         def set_file_id(file_id):
             self.file_id = file_id
-            self.cache.set_info('chatgpt_file_id', file_id)
+            self.cache.set_info('%s_file_id' % self.cache_prefix, file_id)
             log.debug('A new file id was stored: %s' % file_id)
         self.batch_worker.save_file_id.connect(set_file_id)
 
         def remove_batch():
             self.file_id = None
-            self.cache.del_info('chatgpt_batch_id')
-            self.cache.del_info('chatgpt_file_id')
+            self.cache.del_info('%s_batch_id' % self.cache_prefix)
+            self.cache.del_info('%s_file_id' % self.cache_prefix)
             log.debug('The batch information was deleted.')
         self.batch_worker.remove_batch.connect(remove_batch)
 
@@ -197,12 +214,20 @@ class ChatgptBatchTranslationManager(QDialog):
     def layout_create(self):
         title = QLabel(_('Create a new batch translation'))
         title.setStyleSheet('font-size:16px;font-weight:bold;')
-        message = QLabel(_(
-            'All original content must be uploaded to OpenAI for batch '
-            'translation, and you will need to wait up to 24 hours to '
-            'continue the translation process.'
-            '<a href="https://cookbook.openai.com/examples/batch_processing">'
-            'more details</a>'))
+        if self.select_all:
+            text = _(
+                'All original content ({0} paragraphs) must be uploaded to '
+                '{1} for batch translation, and you will need to wait up '
+                'to 24 hours to continue the translation process.'
+                '<a href="{2}">more details</a>')
+        else:
+            text = _(
+                'The selected original content ({0} paragraphs) must be '
+                'uploaded to {1} for batch translation, and you will need '
+                'to wait up to 24 hours to continue the translation process.'
+                '<a href="{2}">more details</a>')
+        message = QLabel(text.format(
+            self.paragraph_count, self.provider, self.docs_url))
         message.setWordWrap(True)
         message.setOpenExternalLinks(True)
         button = QPushButton('Create Batch Translation')
@@ -285,11 +310,13 @@ class ChatgptBatchTranslationManager(QDialog):
             detail.clear()
             batch_status = data.get('status')
             status.setText(str(batch_status))
-            if batch_status == 'completed':
-                request_counts = data.get('request_counts')
+            request_counts = data.get('request_counts')
+            error_info = data.get('errors')
+            if request_counts:
                 detail.appendPlainText(str(request_counts))
-            else:
-                error_info = data.get('errors')
+            if error_info:
+                detail.appendPlainText(str(error_info))
+            elif batch_status != 'completed' and not request_counts:
                 detail.appendPlainText(str(error_info))
         self.batch_worker.trans_details.connect(set_details_data)
 
