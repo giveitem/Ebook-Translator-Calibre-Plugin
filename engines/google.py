@@ -351,6 +351,9 @@ class GeminiTranslate(GenAI):
     models: list[str] = []
     # TODO: Handle the default model more appropriately.
     model: str | None = 'gemini-2.5-flash'
+    # https://ai.google.dev/gemini-api/docs/flex-inference
+    flex = False
+    flex_request_timeout: float = 600.0
 
     def __init__(self):
         super().__init__()
@@ -360,6 +363,12 @@ class GeminiTranslate(GenAI):
         self.top_p = self.config.get('top_p', self.top_p)
         self.stream = self.config.get('stream', self.stream)
         self.model = self.config.get('model', self.model)
+        self.flex = self.config.get('flex', self.flex)
+        if self.flex:
+            # Flex can sit in a queue for minutes; streaming sockets die first.
+            self.stream = False
+            if self.request_timeout < self.flex_request_timeout:
+                self.request_timeout = self.flex_request_timeout
 
     def _prompt(self, text):
         prompt = self.prompt.replace('<tlang>', self.target_lang)
@@ -401,7 +410,7 @@ class GeminiTranslate(GenAI):
         return {'Content-Type': 'application/json'}
 
     def get_body(self, text):
-        return json.dumps({
+        body = {
             "contents": [
                 {"role": "user", "parts": [{"text": self._prompt(text)}]},
             ],
@@ -430,7 +439,10 @@ class GeminiTranslate(GenAI):
                     "threshold": "BLOCK_NONE"
                 },
             ],
-        })
+        }
+        if self.flex:
+            body['serviceTier'] = 'flex'
+        return json.dumps(body)
 
     @staticmethod
     def extract_text(payload):
@@ -494,6 +506,8 @@ class GeminiBatchTranslate:
     def __init__(self, translator):
         self.translator = translator
         self.translator.stream = False
+        # Batch already has its own 50% discount; Flex is a sync-only tier.
+        self.translator.flex = False
         self._inlined_requests = []
         self._latest = {}
 
@@ -533,22 +547,65 @@ class GeminiBatchTranslate:
             return name
         return '%s/%s' % (prefix, name)
 
+    def _model_resource(self):
+        return self._ensure_prefix(self.translator.model, 'models')
+
     def _batch_url(self, batch_id):
         return '%s/%s' % (
             self.api_base, self._ensure_prefix(batch_id, 'batches'))
+
+    def _to_snake_case(self, value):
+        """JSONL batch input expects proto field names, not JSON camelCase."""
+        if isinstance(value, list):
+            return [self._to_snake_case(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        converted = {}
+        for key, item in value.items():
+            snake = []
+            for index, char in enumerate(key):
+                if char.isupper() and index:
+                    snake.append('_')
+                snake.append(char.lower())
+            converted[''.join(snake)] = self._to_snake_case(item)
+        return converted
+
+    def _batch_payload(self, file_id):
+        # Official REST uses proto field names, not camelCase json_name.
+        # https://ai.google.dev/gemini-api/docs/batch-api
+        # CamelCase leaves display_name/input_config empty and the API
+        # returns FAILED_PRECONDITION: Precondition check failed.
+        batch = {'display_name': 'ebook-translator'}
+        if file_id == self.inline_file_id:
+            batch['input_config'] = {
+                'requests': {
+                    'requests': self._inlined_requests or [],
+                }
+            }
+        else:
+            batch['input_config'] = {
+                'file_name': self._ensure_prefix(file_id, 'files')
+            }
+        return {'batch': batch}
+
+    def _request_body(self, text):
+        # Official REST inline example sends only contents. Extra fields
+        # from generateContent (BLOCK_NONE, topK, model) fail batch create.
+        body = json.loads(self.translator.get_body(text))
+        return {'contents': body.get('contents') or []}
 
     def _build_requests(self, paragraphs):
         inlined = []
         jsonl_lines = []
         for paragraph in paragraphs:
-            body = json.loads(self.translator.get_body(paragraph.original))
+            body = self._request_body(paragraph.original)
             inlined.append({
                 'request': body,
                 'metadata': {'key': paragraph.md5},
             })
             jsonl_lines.append(json.dumps({
                 'key': paragraph.md5,
-                'request': body,
+                'request': self._to_snake_case(body),
             }))
         return inlined, '\n'.join(jsonl_lines).encode('utf-8')
 
@@ -562,15 +619,8 @@ class GeminiBatchTranslate:
                 .format(self.translator.model))
         inlined, jsonl = self._build_requests(paragraphs)
         self._inlined_requests = inlined
-        inline_body = json.dumps({
-            'batch': {
-                'display_name': 'ebook-translator',
-                'input_config': {
-                    'requests': {'requests': inlined},
-                },
-            }
-        }).encode('utf-8')
-        if len(inline_body) < self.inline_size_limit:
+        inline_body = json.dumps(self._batch_payload(self.inline_file_id))
+        if len(inline_body.encode('utf-8')) < self.inline_size_limit:
             return self.inline_file_id
         return self._upload_jsonl(jsonl)
 
@@ -590,11 +640,16 @@ class GeminiBatchTranslate:
             'X-Goog-Upload-Protocol': 'resumable',
             'X-Goog-Upload-Command': 'start',
             'X-Goog-Upload-Header-Content-Length': str(len(payload)),
-            'X-Goog-Upload-Header-Content-Type': 'application/json',
+            'X-Goog-Upload-Header-Content-Type': 'application/jsonl',
         })
         start_response = request(
             self.upload_endpoint,
-            json.dumps({'file': {'display_name': 'ebook-translator-batch'}}),
+            json.dumps({
+                'file': {
+                    'display_name': 'ebook-translator-batch',
+                    'mime_type': 'application/jsonl',
+                }
+            }),
             start_headers, 'POST', proxy_uri=self.translator.proxy_uri,
             raw_object=True)
         upload_url = self._get_upload_url(start_response)
@@ -612,35 +667,54 @@ class GeminiBatchTranslate:
         file_id = file_info.get('name')
         if not file_id:
             raise Exception(_('Failed to upload Gemini batch input file.'))
-        return file_id
+        return self._wait_file_active(file_id, file_info)
+
+    def _wait_file_active(self, file_id, file_info=None):
+        """Batch create fails with FAILED_PRECONDITION until the file is ACTIVE."""
+        info = file_info or {}
+        deadline = time.time() + 60
+        while True:
+            state = str(info.get('state') or '').upper()
+            if not state or 'ACTIVE' in state:
+                return file_id
+            if 'FAILED' in state:
+                raise Exception(_('Failed to upload Gemini batch input file.'))
+            if time.time() >= deadline:
+                raise Exception(_('Gemini batch input file is not ready.'))
+            time.sleep(1)
+            response = request(
+                '%s/%s' % (
+                    self.api_base, self._ensure_prefix(file_id, 'files')),
+                headers=self.headers(),
+                proxy_uri=self.translator.proxy_uri)
+            info = json.loads(response)
+            if isinstance(info, dict):
+                info = info.get('file') or info
 
     def create(self, file_id):
-        if file_id == self.inline_file_id:
-            body = json.dumps({
-                'batch': {
-                    'display_name': 'ebook-translator',
-                    'input_config': {
-                        'requests': {
-                            'requests': self._inlined_requests or [],
-                        }
-                    }
-                }
-            })
-        else:
-            body = json.dumps({
-                'batch': {
-                    'display_name': 'ebook-translator',
-                    'input_config': {
-                        'file_name': file_id,
-                    }
-                }
-            })
-        response = request(
-            '%s/%s:batchGenerateContent' % (
-                self.models_endpoint, self.translator.model),
-            body, self.headers(), 'POST',
-            proxy_uri=self.translator.proxy_uri)
-        return json.loads(response).get('name')
+        model_name = (self.translator.model or '').split('/')[-1]
+        try:
+            response = request(
+                '%s/%s:batchGenerateContent' % (
+                    self.models_endpoint, model_name),
+                json.dumps(self._batch_payload(file_id)),
+                self.headers(), 'POST',
+                proxy_uri=self.translator.proxy_uri)
+            return json.loads(response).get('name')
+        except Exception as e:
+            err_str = str(e)
+            if 'FAILED_PRECONDITION' in err_str or 'Precondition check failed' in err_str:
+                raise Exception(_(
+                    'Gemini Batch API requires a Paid Tier account (Billing enabled). '
+                    'Free Tier API keys do not support the Batch API and fail with '
+                    'HTTP 400 FAILED_PRECONDITION ("Precondition check failed").\n\n'
+                    'To resolve this:\n'
+                    '1. In Google AI Studio (https://aistudio.google.com/), link a '
+                    'Billing Account to your project to upgrade to Paid Tier.\n'
+                    '2. Alternatively, use standard translation (or enable Flex inference in '
+                    'Plugin Settings for a 50% discount on regular translation without using Batch API).'
+                ))
+            raise
 
     def check(self, batch_id):
         response = request(

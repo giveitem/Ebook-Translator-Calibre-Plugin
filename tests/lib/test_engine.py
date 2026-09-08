@@ -1020,6 +1020,52 @@ class TestOpenRouterBatchTranslate(unittest.TestCase):
         self.assertTrue(self.batch_translator.delete('inline'))
 
 
+class TestGeminiTranslate(unittest.TestCase):
+    def setUp(self):
+        GeminiTranslate.set_config({'api_keys': ['test-key']})
+        GeminiTranslate.lang_codes = {
+            'source': {'English': 'en'}, 'target': {'Chinese': 'zh'}}
+        self.translator = GeminiTranslate()
+        self.translator.set_source_lang('English')
+        self.translator.set_target_lang('Chinese')
+
+    def tearDown(self):
+        GeminiTranslate.set_config({})
+
+    def test_created_engine(self):
+        self.assertIsInstance(self.translator, Base)
+        self.assertIsInstance(self.translator, GenAI)
+        self.assertFalse(self.translator.flex)
+        self.assertTrue(self.translator.stream)
+        self.assertEqual(self.translator.request_timeout, 30.0)
+
+    def test_get_body(self):
+        body = json.loads(self.translator.get_body('test content'))
+        self.assertNotIn('serviceTier', body)
+        self.assertEqual(
+            body['contents'][0]['parts'][0]['text'].endswith(
+                'Start translating: test content'),
+            True)
+
+    def test_get_body_with_flex(self):
+        self.translator.flex = True
+        body = json.loads(self.translator.get_body('test content'))
+        self.assertEqual(body['serviceTier'], 'flex')
+
+    def test_flex_disables_stream_and_raises_timeout(self):
+        GeminiTranslate.set_config({
+            'api_keys': ['test-key'],
+            'flex': True,
+            'stream': True,
+            'request_timeout': 30.0,
+        })
+        translator = GeminiTranslate()
+        self.assertTrue(translator.flex)
+        self.assertFalse(translator.stream)
+        self.assertEqual(
+            translator.request_timeout, GeminiTranslate.flex_request_timeout)
+
+
 class TestGeminiBatchTranslate(unittest.TestCase):
     def setUp(self):
         self.mock_translator = Mock(GeminiTranslate)
@@ -1039,12 +1085,17 @@ class TestGeminiBatchTranslate(unittest.TestCase):
             'contents': [{'role': 'user', 'parts': [{'text': text}]}],
             'generationConfig': {
                 'temperature': 0.9, 'topP': 1.0, 'topK': 1},
+            'safetySettings': [{
+                'category': 'HARM_CATEGORY_HATE_SPEECH',
+                'threshold': 'BLOCK_NONE',
+            }],
         })
 
     def test_created_translator(self):
         self.assertIsInstance(self.batch_translator, GeminiBatchTranslate)
         self.assertIs(self.mock_translator, self.batch_translator.translator)
         self.assertFalse(self.mock_translator.stream)
+        self.assertFalse(self.mock_translator.flex)
         self.assertEqual(
             self.batch_translator.api_base,
             'https://generativelanguage.googleapis.com/v1beta')
@@ -1064,6 +1115,17 @@ class TestGeminiBatchTranslate(unittest.TestCase):
         self.assertEqual(
             self.batch_translator.supported_models(),
             ['gemini-2.5-flash', 'gemini-2.5-pro'])
+
+    def test_to_snake_case(self):
+        self.assertEqual(
+            self.batch_translator._to_snake_case({
+                'generationConfig': {'topP': 1.0, 'topK': 1},
+                'safetySettings': [{'threshold': 'BLOCK_NONE'}],
+            }),
+            {
+                'generation_config': {'top_p': 1.0, 'top_k': 1},
+                'safety_settings': [{'threshold': 'BLOCK_NONE'}],
+            })
 
     @patch(module_name + '.google.GeminiBatchTranslate.supported_models')
     def test_upload_with_unsupported_model(self, mock_supported_models):
@@ -1097,6 +1159,19 @@ class TestGeminiBatchTranslate(unittest.TestCase):
         self.assertEqual(
             self.batch_translator._inlined_requests[0]['metadata']['key'],
             'abc')
+        self.assertEqual(
+            self.batch_translator._inlined_requests[0]['request'],
+            {'contents': [{
+                'role': 'user', 'parts': [{'text': 'test content 1'}]}]})
+        self.assertNotIn(
+            'safetySettings',
+            self.batch_translator._inlined_requests[0]['request'])
+        self.assertNotIn(
+            'generationConfig',
+            self.batch_translator._inlined_requests[0]['request'])
+        self.assertNotIn(
+            'model',
+            self.batch_translator._inlined_requests[0]['request'])
 
     @patch.object(GeminiBatchTranslate, 'inline_size_limit', 1)
     @patch(module_name + '.google.GeminiBatchTranslate.supported_models')
@@ -1132,6 +1207,10 @@ class TestGeminiBatchTranslate(unittest.TestCase):
         upload_call = mock_request.call_args_list[1]
         self.assertEqual(upload_call[0][0], 'https://example.com/upload-url')
         self.assertIn(b'"key": "abc"', upload_call[0][1])
+        self.assertIn(b'"contents"', upload_call[0][1])
+        self.assertNotIn(b'"generation_config"', upload_call[0][1])
+        self.assertNotIn(b'"safety_settings"', upload_call[0][1])
+        self.assertNotIn(b'"safetySettings"', upload_call[0][1])
         self.assertEqual(
             upload_call[0][2]['X-Goog-Upload-Command'], 'upload, finalize')
 
@@ -1248,6 +1327,23 @@ class TestGeminiBatchTranslate(unittest.TestCase):
             'gemini-2.5-flash:batchGenerateContent',
             body, self.mock_headers, 'POST',
             proxy_uri=self.mock_translator.proxy_uri)
+
+    @patch(module_name + '.google.request')
+    def test_create_failed_precondition_raises_clear_error(self, mock_request):
+        mock_request.side_effect = Exception(
+            'HTTP Error 400: Bad Request\n'
+            '{\n'
+            '  "error": {\n'
+            '    "code": 400,\n'
+            '    "message": "Precondition check failed.",\n'
+            '    "status": "FAILED_PRECONDITION"\n'
+            '  }\n'
+            '}'
+        )
+        with self.assertRaises(Exception) as ctx:
+            self.batch.create('inline')
+        self.assertIn('Paid Tier', str(ctx.exception))
+        self.assertIn('Billing enabled', str(ctx.exception))
 
     @patch(module_name + '.google.request')
     def test_check(self, mock_request):

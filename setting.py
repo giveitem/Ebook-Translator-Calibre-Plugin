@@ -564,6 +564,18 @@ class TranslationSetting(QDialog):
         thinking_enabled.setVisible(False)
         genai_layout.addRow(thinking_label, thinking_enabled)
 
+        flex_label = QLabel(_('Flex'))
+        flex_enabled = QCheckBox(_(
+            'Enable Flex inference (50% cost, variable latency)'))
+        flex_enabled.setToolTip(_(
+            'Gemini Flex uses spare capacity at half the standard price. '
+            'Requests can take 1–15 minutes and may fail when capacity is '
+            'full. Streaming is disabled, and the timeout is raised to '
+            '10 minutes. See https://ai.google.dev/gemini-api/docs/flex-inference'))
+        flex_label.setVisible(False)
+        flex_enabled.setVisible(False)
+        genai_layout.addRow(flex_label, flex_enabled)
+
         sampling_btn_group = QButtonGroup(sampling_widget)
         sampling_btn_group.addButton(temperature, 0)
         sampling_btn_group.addButton(top_p, 1)
@@ -719,6 +731,34 @@ class TranslationSetting(QDialog):
                     config.get('thinking', self.current_engine.thinking))
                 thinking_enabled.toggled.connect(
                     lambda checked: config.update(thinking=checked))
+            # Flex inference (Gemini)
+            # https://ai.google.dev/gemini-api/docs/flex-inference
+            flex_label.setVisible(is_gemini)
+            flex_enabled.setVisible(is_gemini)
+            if is_gemini:
+                flex_on = config.get('flex', self.current_engine.flex)
+                flex_enabled.setChecked(flex_on)
+                stream_enabled.setDisabled(flex_on)
+                if flex_on:
+                    stream_enabled.setChecked(False)
+                    config.update(stream=False)
+
+                def toggle_flex(checked):
+                    config.update(flex=checked)
+                    stream_enabled.setDisabled(checked)
+                    if checked:
+                        stream_enabled.setChecked(False)
+                        config.update(stream=False)
+                        timeout = config.get(
+                            'request_timeout',
+                            self.current_engine.request_timeout)
+                        minimum = self.current_engine.flex_request_timeout
+                        if timeout < minimum:
+                            config.update(request_timeout=minimum)
+                            request_timeout.setValue(minimum)
+                flex_enabled.toggled.connect(toggle_flex)
+            else:
+                stream_enabled.setDisabled(False)
             genai_group.setVisible(True)
 
         def choose_default_engine(index):

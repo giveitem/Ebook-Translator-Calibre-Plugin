@@ -72,11 +72,12 @@ class ChatgptBatchTranslationWorker(QObject):
     def create_batch(self):
         self.process_tip.emit(_('processing...'))
         self.stack_index.emit(1)
-        inline_id = getattr(self._batch_translator, 'inline_file_id', None)
-        if self._file_id is None or self._file_id == inline_id:
-            self._file_id = self._batch_translator.upload(self._paragraphs)
-            log.debug('A new file was uploaded: %s' % self._file_id)
-            self.save_file_id.emit(self._file_id)
+        # Always rebuild input for a new job. Reusing a cached file from a
+        # previous Batch All / failed create leaves Gemini with a stale or
+        # inactive file and returns FAILED_PRECONDITION.
+        self._file_id = self._batch_translator.upload(self._paragraphs)
+        log.debug('A new file was uploaded: %s' % self._file_id)
+        self.save_file_id.emit(self._file_id)
         self._batch_id = self._batch_translator.create(self._file_id)
         log.debug('A batch translation was created: %s' % self._batch_id)
         self.save_batch_id.emit(self._batch_id)
@@ -154,15 +155,6 @@ class ChatgptBatchTranslationManager(QDialog):
         self.batch_thread.finished.connect(self.batch_worker.deleteLater)
         self.batch_thread.start()
 
-        self.stack = QStackedLayout(self)
-        self.stack.setContentsMargins(100, 30, 30, 30)
-        self.stack.addWidget(self.layout_create())
-        self.stack.addWidget(self.layout_process())
-        self.stack.addWidget(self.layout_details())
-        self.stack.addWidget(self.layout_information())
-
-        self.batch_worker.stack_index.connect(self.stack.setCurrentIndex)
-
         self.batch_id = self.cache.get_info('%s_batch_id' % self.cache_prefix)
         self.file_id = self.cache.get_info('%s_file_id' % self.cache_prefix)
 
@@ -181,6 +173,15 @@ class ChatgptBatchTranslationManager(QDialog):
         self.batch_worker.set_paragraphs(paragraphs)
         self.batch_worker.set_batch_id(self.batch_id)
         self.batch_worker.set_file_id(self.file_id)
+
+        self.stack = QStackedLayout(self)
+        self.stack.setContentsMargins(100, 30, 30, 30)
+        self.stack.addWidget(self.layout_create())
+        self.stack.addWidget(self.layout_process())
+        self.stack.addWidget(self.layout_details())
+        self.stack.addWidget(self.layout_information())
+
+        self.batch_worker.stack_index.connect(self.stack.setCurrentIndex)
 
         def set_batch_id(batch_id):
             self.batch_id = batch_id
